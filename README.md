@@ -38,9 +38,20 @@ applications deployable at all: one process per H2 file, one binder per publishe
 pull happens before the stop, so even the registry's own application can be replaced. The
 predecessor is *whatever holds the application's alias* on the environment's network, including
 containers cd did not start — which is how a bootstrap's compose-seeded originals hand themselves
-over to cd on their first pipeline deployment. The one predecessor cd refuses to stop is its own
-container: the planned self-update mechanism is the successor shutting down the predecessor, and
-until it exists a `qits-cd` deployment records a FAILED row saying exactly that.
+over to cd on their first pipeline deployment.
+
+**Self-update is a handoff**, because the one predecessor cd never stops in-process is its own
+container. Deploying `qits-cd` splits the cutover three ways: this instance starts the successor
+(which retries on the H2 lock under its restart policy) and launches a detached **referee** — a
+`--rm` container of the deployment's own image with the entrypoint swapped for the shell — then
+returns with the row left `STARTING`. The referee stops the predecessor (freeing the lock),
+waits up to the health timeout for the successor's gate, and removes whichever side lost — on
+success the predecessor, on a missed gate the successor, restarting the predecessor. The
+surviving instance records the outcome: the successor's startup sweep **adopts** a `STARTING`
+row whose container is itself (ACTIVE, prior rows decommissioned), and a rolled-back
+predecessor's sweep marks it FAILED as any interrupted row. There is no old↔new channel — the
+H2 lock is the mutex, the deployment row is the shared state, and docker is the lifecycle;
+neither instance referees its own succession.
 
 ## The conventions this service is made of
 

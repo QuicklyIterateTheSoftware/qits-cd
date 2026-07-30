@@ -219,21 +219,44 @@ public class CdDeploymentFlowTest {
   }
 
   @Test
-  public void theSelfGuardRefusesToStopItsOwnProcess() {
-    // Deploying the application whose alias this very instance holds: the planned successor-kills-
-    // predecessor mechanism does not exist yet, so the deployment records the honest FAILED row
-    // and stops NOTHING — a half-executed self-cutover would take the deployer down mid-flight.
+  public void aSelfUpdateStartsTheSuccessorAndHandsArbitrationToTheReferee() {
+    // Deploying the application whose alias this very instance holds: the worker must not stop
+    // its own process. It starts the successor, launches the detached referee, and leaves the row
+    // STARTING — the surviving instance's sweep records the outcome, not this one.
     String environmentId = createEnvironment("flow-self", "repo-self", "qits-cd");
     String selfId = "abcdef123456";
+    String selfFullId = selfId + "f".repeat(52);
     driver.scriptSelfId(selfId);
-    driver.scriptAliasHolders(List.of(new DeploymentDriver.Holder(selfId + "f".repeat(52), "qits-cd")));
+    driver.scriptAliasHolders(List.of(new DeploymentDriver.Holder(selfFullId, "qits-cd")));
     postBuildSucceeded("repo-self", "epic/flow-self", SHA_A);
 
-    List<Map<String, Object>> deployments = awaitDeployments(environmentId, 1);
-    assertEquals("FAILED", deployments.get(0).get("status"));
-    assertTrue(((String) deployments.get(0).get("detail")).contains("self-update"));
+    long deadline = System.currentTimeMillis() + 15_000;
+    while (driver.handoffs().isEmpty() && System.currentTimeMillis() < deadline) {
+      try {
+        Thread.sleep(50);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+    }
+    assertEquals(1, driver.handoffs().size(), "the referee was launched");
+    DeploymentDriver.HandoffSpec handoff = driver.handoffs().get(0);
+    assertEquals(selfFullId, handoff.oldContainerId());
+    assertEquals(driver.started().get(0).containerName(), handoff.newContainerName());
+    // Nothing stopped, nothing removed by THIS process — the referee owns retirement.
     assertEquals(List.of(), driver.stoppedContainers());
-    assertEquals(List.of(), driver.started().stream().map(DeploymentDriver.StartSpec::containerName).toList());
+    assertEquals(List.of(), driver.removedContainers());
+    // The row stays STARTING: adoption (successor) or the restart sweep (rollback) finishes it.
+    Map<String, Object> row =
+        given()
+            .when()
+            .get("/cd/api/deployments?environmentId=" + environmentId)
+            .then()
+            .statusCode(200)
+            .extract()
+            .jsonPath()
+            .<Map<String, Object>>getList("deployments")
+            .get(0);
+    assertEquals("STARTING", row.get("status"));
   }
 
   @Test

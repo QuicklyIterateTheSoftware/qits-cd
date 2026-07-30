@@ -63,12 +63,15 @@ container starts (one process per H2 file, one binder per published port — ove
 a stateful application), and *removed* only after the new one passed the health gate; a failed
 gate removes the fresh container and **restarts** what was stopped, leaving the previous
 deployment ACTIVE and serving. Pull precedes stop, so the registry's own application is
-replaceable. cd never stops its own container — a `qits-cd` deployment records an honest FAILED
-row until the planned successor-shuts-down-predecessor self-update exists. Every removal is a
-decision recorded on a deployment row — a decommission, a failed cutover, a teardown — never a
-side effect. The tests that hold this:
+replaceable. cd never stops its own container in-process — deploying `qits-cd` takes the handoff
+path (successor started, detached referee arbitrates, the surviving instance's sweep records the
+outcome; README "Self-update is a handoff"). Every removal is a decision recorded on a
+deployment row — a decommission, a failed cutover, a teardown — never a side effect, with one
+stated exception: the referee's removals, which are the recorded-by-the-survivor arrangement.
+The tests that hold this:
 `CdDeploymentFlowTest.theReplaceCutoverStopsAliasHoldersBeforeStartingAndRemovesThemAfterTheGate`,
-`.aFailedGateRestartsWhatTheCutoverStopped`, and `.theSelfGuardRefusesToStopItsOwnProcess`.
+`.aFailedGateRestartsWhatTheCutoverStopped`,
+`.aSelfUpdateStartsTheSuccessorAndHandsArbitrationToTheReferee`, and `CdSweepAdoptionTest`.
 
 ## Untrusted input
 

@@ -35,6 +35,9 @@ public class FakeDeploymentDriver implements DeploymentDriver {
   /** Every driver call in arrival order, tagged `kind:target` — the cutover ORDER assertions. */
   private final List<String> calls = Collections.synchronizedList(new ArrayList<>());
 
+  private final List<HandoffSpec> handoffs = Collections.synchronizedList(new ArrayList<>());
+  private final java.util.Map<String, String> containerIds = new java.util.concurrent.ConcurrentHashMap<>();
+
   private volatile PullResult nextPull = new PullResult(PullOutcome.OK, null);
   private volatile StartResult nextStart = new StartResult(true, null);
   private volatile HealthResult nextHealth = new HealthResult(true, null);
@@ -52,11 +55,21 @@ public class FakeDeploymentDriver implements DeploymentDriver {
     stoppedContainers.clear();
     restartedContainers.clear();
     calls.clear();
+    handoffs.clear();
+    containerIds.clear();
     nextPull = new PullResult(PullOutcome.OK, null);
     nextStart = new StartResult(true, null);
     nextHealth = new HealthResult(true, null);
     nextHolders = List.of();
     selfId = "";
+  }
+
+  public void scriptContainerId(String containerName, String id) {
+    containerIds.put(containerName, id);
+  }
+
+  public List<HandoffSpec> handoffs() {
+    return List.copyOf(handoffs);
   }
 
   public void scriptAliasHolders(List<Holder> holders) {
@@ -156,6 +169,17 @@ public class FakeDeploymentDriver implements DeploymentDriver {
   @Override
   public String selfContainerId() {
     return selfId;
+  }
+
+  @Override
+  public String containerId(String containerName) {
+    return containerIds.getOrDefault(containerName, "");
+  }
+
+  @Override
+  public void handoff(HandoffSpec spec) {
+    handoffs.add(spec);
+    calls.add("handoff:" + spec.newContainerName());
   }
 
   @Override

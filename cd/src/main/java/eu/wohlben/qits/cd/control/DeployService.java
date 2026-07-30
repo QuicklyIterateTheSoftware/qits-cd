@@ -45,9 +45,10 @@ import org.jboss.logging.Logger;
  * being up mid-cutover. The predecessor is whatever holds the application's alias on the
  * environment's network — including containers cd did not start (a bootstrap's seeded originals),
  * which is how the platform's compose-managed first boot hands itself over to cd. The one
- * predecessor cd refuses to stop is its own container: self-update's planned mechanism is the
- * successor shutting down the predecessor, and until that exists a qits-cd deployment records a
- * FAILED row saying so.
+ * predecessor cd never stops in-process is its own container: deploying cd itself takes the
+ * handoff path — start the successor, launch the detached referee that stops this instance and
+ * arbitrates the gate, and let the surviving instance record the outcome (the successor's sweep
+ * adopts the row; a rolled-back predecessor's sweep fails it).
  */
 @ApplicationScoped
 public class DeployService {
@@ -86,33 +87,65 @@ public class DeployService {
   /**
    * A deployment left {@code QUEUED} or {@code STARTING} by a crash can never make progress — the
    * worker queue does not survive the JVM — so it would show as forever-deploying. Fail those once
-   * at startup. The containers are deliberately NOT reaped: a deployed application outlives its
-   * deployer, and whatever was {@code ACTIVE} before the restart is still serving.
+   * at startup, with one exception: a {@code STARTING} row whose container is <b>this very
+   * process</b> is a self-update handoff that succeeded — the predecessor recorded the row, the
+   * referee retired it, and this instance is the successor booting for the first time. That row
+   * is ADOPTED (ACTIVE, prior ACTIVE rows decommissioned): the instance that survived the
+   * handoff records its outcome. The containers are deliberately NOT reaped: a deployed
+   * application outlives its deployer, and whatever was {@code ACTIVE} before the restart is
+   * still serving.
    */
   void onStart(@Observes StartupEvent event) {
     if (LaunchMode.current() == LaunchMode.TEST) {
       return;
     }
     try {
-      int swept =
-          QuarkusTransaction.requiringNew()
-              .call(
-                  () -> {
-                    List<CdDeployment> orphans =
-                        new ArrayList<>(deployments.listByStatus(CdDeploymentStatus.QUEUED));
-                    orphans.addAll(deployments.listByStatus(CdDeploymentStatus.STARTING));
-                    for (CdDeployment orphan : orphans) {
-                      orphan.status = CdDeploymentStatus.FAILED;
-                      orphan.detail = "[interrupted by a qits-cd restart]";
-                      orphan.finishedAt = Instant.now();
-                    }
-                    return orphans.size();
-                  });
-      if (swept > 0) {
-        LOG.infof("Marked %d deployment(s) left in flight by a previous shutdown as FAILED", swept);
-      }
+      sweepInFlight();
     } catch (RuntimeException e) {
       LOG.warnf(e, "Could not sweep interrupted deployments at startup");
+    }
+  }
+
+  /** Package-private so the suite drives the sweep without a real StartupEvent. */
+  void sweepInFlight() {
+    String self = driver.selfContainerId();
+    int swept =
+        QuarkusTransaction.requiringNew()
+            .call(
+                () -> {
+                  List<CdDeployment> orphans =
+                      new ArrayList<>(deployments.listByStatus(CdDeploymentStatus.QUEUED));
+                  orphans.addAll(deployments.listByStatus(CdDeploymentStatus.STARTING));
+                  int failed = 0;
+                  for (CdDeployment orphan : orphans) {
+                    if (orphan.status == CdDeploymentStatus.STARTING
+                        && orphan.containerName != null
+                        && !self.isBlank()) {
+                      String id = driver.containerId(orphan.containerName);
+                      if (!id.isBlank() && (id.startsWith(self) || self.startsWith(id))) {
+                        for (CdDeployment previous :
+                            deployments.listActiveByApplication(orphan.application.id)) {
+                          previous.status = CdDeploymentStatus.DECOMMISSIONED;
+                          previous.finishedAt = Instant.now();
+                        }
+                        orphan.status = CdDeploymentStatus.ACTIVE;
+                        orphan.detail = "[adopted at startup: this instance is the successor of a self-update handoff]";
+                        orphan.finishedAt = Instant.now();
+                        LOG.infof(
+                            "Adopted deployment %s: this instance (%s) is its container",
+                            orphan.id, orphan.containerName);
+                        continue;
+                      }
+                    }
+                    orphan.status = CdDeploymentStatus.FAILED;
+                    orphan.detail = "[interrupted by a qits-cd restart]";
+                    orphan.finishedAt = Instant.now();
+                    failed++;
+                  }
+                  return failed;
+                });
+    if (swept > 0) {
+      LOG.infof("Marked %d deployment(s) left in flight by a previous shutdown as FAILED", swept);
     }
   }
 
@@ -241,19 +274,45 @@ public class DeployService {
     List<DeploymentDriver.Holder> predecessors =
         driver.aliasHolders(plan.network(), plan.applicationName());
     String self = driver.selfContainerId();
-    if (!self.isBlank()
-        && predecessors.stream().anyMatch(p -> p.id().startsWith(self) || self.startsWith(p.id()))) {
-      // Stopping the predecessor would stop the process performing this deployment. The intended
-      // mechanism — the successor shuts down its predecessor — is planned, not built; record the
-      // honest outcome instead of a half-executed cutover.
-      finish(
-          deploymentId,
-          CdDeploymentStatus.FAILED,
-          "[self-update: the alias '"
-              + plan.applicationName()
-              + "' is held by the qits-cd instance performing this deployment. The planned"
-              + " mechanism (the successor shuts down its predecessor) is not implemented yet —"
-              + " until it is, redeploy qits-cd from the bootstrap]");
+    DeploymentDriver.Holder selfHolder =
+        self.isBlank()
+            ? null
+            : predecessors.stream()
+                .filter(p -> p.id().startsWith(self) || self.startsWith(p.id()))
+                .findFirst()
+                .orElse(null);
+    if (selfHolder != null) {
+      // The self-update handoff. This process cannot stop itself and then finish the cutover, so
+      // the roles split three ways: this instance starts the successor (which retries on the H2
+      // lock under its restart policy) and launches a detached referee; the referee stops this
+      // container — freeing the lock — awaits the successor's health gate, and removes whichever
+      // side lost; the successor's startup sweep adopts the row it finds itself named on. The row
+      // is left STARTING on purpose: adoption marks it ACTIVE, and after a referee rollback this
+      // instance's own sweep marks it FAILED — each outcome recorded by the instance that
+      // survived it.
+      DeploymentDriver.StartResult successor =
+          driver.start(
+              new DeploymentDriver.StartSpec(
+                  plan.environmentId(),
+                  plan.environmentName(),
+                  plan.applicationId(),
+                  plan.applicationName(),
+                  deploymentId,
+                  plan.network(),
+                  imageRef,
+                  containerName,
+                  plan.healthPath()));
+      if (!successor.started()) {
+        driver.remove(containerName);
+        finish(deploymentId, CdDeploymentStatus.FAILED, safe(successor.detail()));
+        return;
+      }
+      driver.handoff(
+          new DeploymentDriver.HandoffSpec(
+              imageRef, selfHolder.id(), containerName, healthTimeoutSeconds));
+      LOG.infof(
+          "Self-update handoff initiated: %s succeeds this instance (%s); the referee arbitrates",
+          containerName, selfHolder.name());
       return;
     }
     for (DeploymentDriver.Holder predecessor : predecessors) {

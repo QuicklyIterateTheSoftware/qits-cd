@@ -38,9 +38,26 @@ public interface DeploymentDriver {
 
   /**
    * This process's own container id ({@code /etc/hostname} in a container), blank when unknown —
-   * the self-update guard: cd must never stop the instance performing the deployment.
+   * what routes a deployment of cd itself onto the handoff path: cd must never stop the instance
+   * performing the deployment.
    */
   String selfContainerId();
+
+  /** The full docker id of the named container, blank when it does not exist. */
+  String containerId(String containerName);
+
+  /**
+   * Launch the detached self-update referee: stop the old container (freeing the H2 lock the
+   * successor is retrying on), await the successor's health gate, then remove the old container —
+   * or, on a missed gate, remove the successor and restart the old. Detached because neither
+   * instance can referee its own succession: the old is about to be stopped and the new cannot
+   * boot until it is.
+   */
+  void handoff(HandoffSpec spec);
+
+  /** Everything the referee needs: who retires, who succeeds, and how long the gate may take. */
+  record HandoffSpec(
+      String imageRef, String oldContainerId, String newContainerName, long timeoutSeconds) {}
 
   /** Start the container, detached, on the environment's network. The image's entrypoint runs. */
   StartResult start(StartSpec spec);

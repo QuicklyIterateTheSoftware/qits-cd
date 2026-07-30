@@ -145,6 +145,30 @@ class DockerDeploymentDriverTest {
   }
 
   @Test
+  void theRefereeArgvSwapsTheEntrypointMountsTheSocketAndCarriesTheArbitrationScript() {
+    DockerDeploymentDriver driver = driver();
+    driver.dockerSocketPath = "/var/run/docker.sock";
+    DeploymentDriver.HandoffSpec spec =
+        new DeploymentDriver.HandoffSpec(
+            "qits-artifacts:8080/qits/qits-cd:abc",
+            "old-full-id",
+            "qits-cd-qits-qits-cd-12345678",
+            120);
+    String script = "docker stop old-full-id\n...";
+
+    List<String> argv = driver.buildHandoffArgv(spec, script);
+
+    assertEquals(List.of("docker", "run", "-d", "--rm"), argv.subList(0, 4));
+    assertTrue(argv.containsAll(List.of("--name", "qits-cd-handoff-12345678")));
+    assertTrue(argv.containsAll(List.of("-v", "/var/run/docker.sock:/var/run/docker.sock")));
+    assertTrue(argv.containsAll(List.of("--entrypoint", "/bin/sh")));
+    // The image is the deployment's own — just pulled, guaranteed present — then -c <script>.
+    int image = argv.indexOf("qits-artifacts:8080/qits/qits-cd:abc");
+    assertEquals("-c", argv.get(image + 1));
+    assertEquals(script, argv.get(image + 2));
+  }
+
+  @Test
   void aHostileHealthPathCannotReachTheShellString() {
     // Belt on top of the boundary's braces: the one value interpolated into a string a shell will
     // run is re-validated at the last line before the argv.

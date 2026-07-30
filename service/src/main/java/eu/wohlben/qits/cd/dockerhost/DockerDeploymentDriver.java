@@ -100,6 +100,10 @@ public class DockerDeploymentDriver implements DeploymentDriver {
   /** Looked up per key rather than {@code @ConfigProperty}: the key carries the application name. */
   @Inject Config config;
 
+  /** Mounted into the handoff referee, which drives docker exactly like this process does. */
+  @ConfigProperty(name = "qits.cd.docker-socket-path")
+  String dockerSocketPath;
+
   @Override
   public void ensureNetwork(String network) {
     if (CdProcess.run(null, List.of(runtime, "network", "inspect", network), CLEANUP_TIMEOUT, 8192)
@@ -216,6 +220,86 @@ public class DockerDeploymentDriver implements DeploymentDriver {
       return java.nio.file.Files.readString(java.nio.file.Path.of("/etc/hostname")).strip();
     } catch (Exception e) {
       return "";
+    }
+  }
+
+  @Override
+  public String containerId(String containerName) {
+    CdProcess.Result result =
+        CdProcess.run(
+            null,
+            List.of(runtime, "inspect", "--format", "{{.Id}}", containerName),
+            INSPECT_TIMEOUT,
+            8192);
+    if (result.exitCode() != 0 || result.output() == null) {
+      return "";
+    }
+    return result.output().strip();
+  }
+
+  @Override
+  public void handoff(HandoffSpec spec) {
+    // Everything interpolated into this script is cd's own: the old id came from docker, the new
+    // name from containerName() (dns-label charset), the timeout from config. The referee runs
+    // the deployment's own image — just pulled, guaranteed present — with its entrypoint swapped
+    // for the shell, and --rm so a finished referee leaves nothing behind.
+    String script =
+        String.join(
+            "\n",
+            "docker stop " + spec.oldContainerId(),
+            "t=0",
+            "while [ \"$t\" -lt " + spec.timeoutSeconds() + " ]; do",
+            "  s=$(docker inspect --format"
+                + " '{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'"
+                + " " + spec.newContainerName() + " 2>/dev/null || echo gone)",
+            "  case \"$s\" in running/healthy) docker rm -f " + spec.oldContainerId() + "; exit 0;; esac",
+            "  sleep 2",
+            "  t=$((t+2))",
+            "done",
+            "docker rm -f " + spec.newContainerName(),
+            "docker start " + spec.oldContainerId());
+    CdProcess.Result result =
+        CdProcess.run(null, buildHandoffArgv(spec, script), RUN_TIMEOUT, outputMaxChars);
+    if (result.exitCode() != 0) {
+      LOG.errorf("Could not launch the handoff referee: %s", result.output());
+    }
+  }
+
+  /** Package-private for the argv test. */
+  List<String> buildHandoffArgv(HandoffSpec spec, String script) {
+    String suffix =
+        spec.newContainerName().length() > 8
+            ? spec.newContainerName().substring(spec.newContainerName().length() - 8)
+            : spec.newContainerName();
+    List<String> argv = new ArrayList<>();
+    argv.add(runtime);
+    argv.add("run");
+    argv.add("-d");
+    argv.add("--rm");
+    argv.add("--name");
+    argv.add("qits-cd-handoff-" + suffix);
+    argv.add("-v");
+    argv.add(dockerSocketPath + ":" + dockerSocketPath);
+    socketGid().ifPresent(gid -> {
+      argv.add("--group-add");
+      argv.add(gid);
+    });
+    argv.add("--entrypoint");
+    argv.add("/bin/sh");
+    argv.add(spec.imageRef());
+    argv.add("-c");
+    argv.add(script);
+    return List.copyOf(argv);
+  }
+
+  /** The socket's owning group, so the referee (uid 1001 in the image) may use it. */
+  private java.util.Optional<String> socketGid() {
+    try {
+      Object gid =
+          java.nio.file.Files.getAttribute(java.nio.file.Path.of(dockerSocketPath), "unix:gid");
+      return java.util.Optional.of(String.valueOf(gid));
+    } catch (Exception e) {
+      return java.util.Optional.empty();
     }
   }
 
