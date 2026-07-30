@@ -75,10 +75,15 @@ service-to-service calls on qits-net address the same paths.
 | `/cd/api/events/build-succeeded` | POST | the qits-ci intake (hidden from the OpenAPI document) |
 | `/cd/q/openapi`, `/cd/q/swagger-ui` | GET | the API document |
 
-Writes (the intake **and** the environment lifecycle — both move containers on the host) are
-guarded by the static machine token `X-CD-Token` / `qits.cd.token`, blank ⇒ open (dev/test), the
-`qits.ci.token` pattern exactly. Reads are open. User identity is the gateway's `X-Qits-User`
-header (see `service/…/security/`); this service authenticates nothing and authorizes nothing.
+The build-succeeded intake is guarded by the static machine token `X-CD-Token` / `qits.cd.token`,
+blank ⇒ open (dev/test), the `qits.ci.token` pattern exactly — and it is the **only** guarded
+path, for the same single reason ci's intake is: it sits on the gateway's token-free allowlist, so
+the token is its whole write protection at the front door. The environment surface carries no
+token: it is not on the allowlist (the gateway demands a session for it), and on qits-net the
+platform's services are trusted callers — hardening intra-network machine surfaces further is a
+later, platform-wide decision, deliberately not half-solved here. Reads are open. User identity is
+the gateway's `X-Qits-User` header (see `service/…/security/`); this service authenticates nothing
+and authorizes nothing.
 
 The intake is a **fire-and-forget contract**: qits-ci's notifier swallows delivery failures at
 debug, so a path mismatch between the two repos raises no error anywhere and deployments simply

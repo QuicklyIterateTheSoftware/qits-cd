@@ -11,10 +11,12 @@ import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 /**
- * With {@code qits.cd.token} configured, {@link CdTokenFilter} guards the write surface — BOTH the
- * build-succeeded intake and the environment lifecycle, since both callers are machines and both
- * writes move containers on the host. The blank-token open mode is exercised implicitly by every
- * other cd test (no token in test properties).
+ * With {@code qits.cd.token} configured, {@link CdTokenFilter} guards the build-succeeded intake —
+ * and ONLY the intake: it is the one cd path on the gateway's token-free allowlist, so this filter
+ * is its whole write protection. The environment surface is deliberately unguarded (session policy
+ * at the front door, trusted callers on qits-net) and the test pins that too, so widening the
+ * guard is a conscious change rather than a drive-by. The blank-token open mode is exercised
+ * implicitly by every other cd test (no token in test properties).
  *
  * <p>The filter fails open for paths it does not recognise, so these tests POST the real absolute
  * addresses: a guard that quietly stopped matching shows up here as a 2xx where a 401 must be.
@@ -76,25 +78,19 @@ public class CdTokenGuardTest {
   }
 
   @Test
-  public void environmentWritesAreGuardedToo() {
+  public void theEnvironmentSurfaceIsNotTokenGuarded() {
+    // Deliberate: /cd/api/environments is not on the gateway's public allowlist, so the front door
+    // already demands a session for it, and on qits-net the callers are trusted. The intake is the
+    // only path whose write protection is this token.
     given()
         .contentType(ContentType.JSON)
-        .body(environment("guard-env-denied"))
-        .when()
-        .post("/cd/api/environments")
-        .then()
-        .statusCode(401);
-
-    given().when().delete("/cd/api/environments/some-id").then().statusCode(401);
-
-    given()
-        .contentType(ContentType.JSON)
-        .header("X-CD-Token", TOKEN)
-        .body(environment("guard-env-created"))
+        .body(environment("guard-env-open"))
         .when()
         .post("/cd/api/environments")
         .then()
         .statusCode(201);
+
+    given().when().delete("/cd/api/environments/no-such-environment").then().statusCode(404);
   }
 
   @Test

@@ -11,11 +11,16 @@ import java.util.Set;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
 /**
- * Guards the cd <b>write</b> surface with a single static token — the {@code CiTokenFilter}
- * pattern, over two resources rather than one: the build-succeeded intake (the caller is qits-ci)
- * and the environment lifecycle (the caller is the epic orchestration). Both callers are other
- * services holding no user session, and both writes start or stop containers on the host, which is
- * why the guard covers the environment surface here where ci guards only its intake.
+ * Guards the build-succeeded intake under {@code /cd/api/events/} with a single static token — the
+ * {@code CiTokenFilter} pattern exactly, and for the same single reason: that path is on the
+ * gateway's token-free {@code PublicPaths} allowlist (the caller is qits-ci's {@code
+ * CdBuildNotifier}, a process holding no user session), so this filter is the write protection on
+ * a spelling the session policy deliberately does not cover.
+ *
+ * <p>The environment surface is <b>not</b> guarded here, deliberately: it is not on the gateway's
+ * allowlist (so the front door already demands a session for it), and on qits-net the platform's
+ * services are trusted callers. Hardening intra-network machine surfaces beyond that is a decision
+ * for later, made once and platform-wide — not piecemeal in this filter.
  *
  * <p>The header is {@code X-CD-Token}. When {@code qits.cd.token} is blank (the dev/test default)
  * the guard is a no-op, keeping dev and the suites friction-free. Reads (GET) are never guarded —
@@ -40,20 +45,16 @@ public class CdTokenFilter implements ContainerRequestFilter {
       return; // open in dev/test — no token configured
     }
     // getPath() is relative to the JAX-RS base (quarkus.rest.path, /cd/api); normalize any leading
-    // slash. Matching the two resources rather than the whole service is deliberate: these are the
-    // write surfaces, and a future write elsewhere under /cd/api should have to opt into this
+    // slash. Matching the resource rather than the whole service is deliberate: the intake is the
+    // guarded surface, and a future write elsewhere under /cd/api should have to opt into this
     // guard consciously. Note the filter fails OPEN for unrecognised paths — CdTokenGuardTest is
     // what stands between a renamed resource and a guard that quietly stopped matching.
     String path = requestContext.getUriInfo().getPath();
     if (path.startsWith("/")) {
       path = path.substring(1);
     }
-    boolean guarded =
-        path.equals("events")
-            || path.startsWith("events/")
-            || path.equals("environments")
-            || path.startsWith("environments/");
-    if (!guarded || !WRITE_METHODS.contains(requestContext.getMethod())) {
+    if (!(path.equals("events") || path.startsWith("events/"))
+        || !WRITE_METHODS.contains(requestContext.getMethod())) {
       return;
     }
     if (!token.equals(requestContext.getHeaderString(TOKEN_HEADER))) {

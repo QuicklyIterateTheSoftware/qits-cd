@@ -34,9 +34,9 @@
 #                           on qits-net, and the daemon must additionally trust it
 #                           (insecure-registries) while the platform speaks plain HTTP. Wrong, every
 #                           deployment records FAILED with a pull error.
-#   QITS_CD_TOKEN           blank means the write surface — which starts containers on the host —
-#                           is unauthenticated. Must match qits-ci's notifier and the epic
-#                           orchestration.
+#   QITS_CD_TOKEN           blank means the build-succeeded intake — the one cd path on the
+#                           gateway's token-free allowlist — is unauthenticated there. Must match
+#                           qits-ci's qits.cd.token.
 #   QITS_OBSERVABILITY_URL  where OTLP export goes; absent qits-observability, the exporter logs a
 #                           warning per export loudly enough to bury real lines
 #                           (OTEL_SDK_DISABLED=true is the escape hatch).

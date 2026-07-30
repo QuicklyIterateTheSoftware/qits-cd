@@ -91,11 +91,14 @@ regression, not a feature.
 suite inherits it — a resource's `@Path` is relative to it and must never repeat `cd`; tests
 address the absolute path, which is what makes them catch a prefix regression.
 
-`CdTokenFilter` matches `UriInfo.getPath()` (relative to the base) against the literals `events`
-and `environments`, write methods only, and **fails open** for anything it does not recognise.
-Move or rename a controller's `@Path` and the guard stops matching silently — `CdTokenGuardTest`
-POSTs the real absolute addresses with no token and demands 401s; change the two together and keep
-that test on the absolute paths.
+`CdTokenFilter` matches `UriInfo.getPath()` (relative to the base) against the literal `events`,
+write methods only, and **fails open** for anything it does not recognise. It guards the intake
+and ONLY the intake — the one cd path on the gateway's token-free allowlist; the environment
+surface sits behind the gateway's session policy and is trusted service-to-service on qits-net,
+and `CdTokenGuardTest` pins the unguardedness too, so widening the guard is a conscious decision
+rather than a drive-by. Move or rename a controller's `@Path` and the guard stops matching
+silently — the test POSTs the real absolute addresses; change the two together and keep it on the
+absolute paths.
 
 The intake path is a **cross-repo contract**: qits-ci's `CdBuildNotifier` POSTs
 `/cd/api/events/build-succeeded` fire-and-forget via its `qits.cd.intake-url`. A mismatch raises
