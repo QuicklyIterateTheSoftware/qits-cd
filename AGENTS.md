@@ -31,9 +31,9 @@ package:
   (`EnvironmentService`, `DeployService`), the validation (`CdIdentifiers`), the shell-out
   (`CdProcess`), the image-reference convention (`ImageRefs`) and the docker seam
   (`DeploymentDriver`).
-- `service/` — `api` (the JAX-RS routes, `CdTokenFilter`, `CdExceptionMapper`), `security` (the
-  forward-auth pair), and `dockerhost` (`DockerDeploymentDriver` — the sole implementation of the
-  seam, kept here because it is cd's whole relationship with the host's docker daemon).
+- `service/` — `api` (the JAX-RS routes and `CdExceptionMapper`), `security` (the forward-auth
+  pair), and `dockerhost` (`DockerDeploymentDriver` — the sole implementation of the seam, kept
+  here because it is cd's whole relationship with the host's docker daemon).
 
 The directories are `cd/` and `service/`; the artifactIds are `qits-cd-domain` and
 `qits-cd-service` — generic coordinates would collide in a shared `~/.m2`.
@@ -66,8 +66,8 @@ is the test that holds this.
 
 ## Untrusted input
 
-The write surface is attacker-reachable by design (the token defaults to blank), and several of
-its strings end up in expensive places. `CdIdentifiers` validates all of them at the boundary:
+The write surface's strings end up in expensive places, so they are validated as untrusted at the
+boundary regardless of who the caller is believed to be. `CdIdentifiers` holds all of it:
 
 - **Environment and application names** become docker network names, network aliases, image path
   segments and container names — the dns-label charset, nothing else.
@@ -91,14 +91,12 @@ regression, not a feature.
 suite inherits it — a resource's `@Path` is relative to it and must never repeat `cd`; tests
 address the absolute path, which is what makes them catch a prefix regression.
 
-`CdTokenFilter` matches `UriInfo.getPath()` (relative to the base) against the literal `events`,
-write methods only, and **fails open** for anything it does not recognise. It guards the intake
-and ONLY the intake — the one cd path on the gateway's token-free allowlist; the environment
-surface sits behind the gateway's session policy and is trusted service-to-service on qits-net,
-and `CdTokenGuardTest` pins the unguardedness too, so widening the guard is a conscious decision
-rather than a drive-by. Move or rename a controller's `@Path` and the guard stops matching
-silently — the test POSTs the real absolute addresses; change the two together and keep it on the
-absolute paths.
+There is **no machine token in this service** — nothing of cd is on the gateway's token-free
+allowlist, so every `/cd/*` path is session-guarded at the front door, and qits-net callers are
+trusted (that is where the intake's sender actually dials). The `qits.ci.token` pattern belongs to
+paths that are allowlisted at the gateway; do not reintroduce it here without the allowlist entry
+that would give it a job, and never the allowlist entry without the guard — qits-gateway's
+`PublicPathsTest.nothingOfCdIsPublic` is what makes that a conscious pair of changes.
 
 The intake path is a **cross-repo contract**: qits-ci's `CdBuildNotifier` POSTs
 `/cd/api/events/build-succeeded` fire-and-forget via its `qits.cd.intake-url`. A mismatch raises

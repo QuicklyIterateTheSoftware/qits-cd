@@ -22,10 +22,10 @@ import org.eclipse.microprofile.openapi.annotations.Operation;
 import org.eclipse.microprofile.openapi.annotations.responses.APIResponse;
 
 /**
- * The environment surface: creation and teardown (machine calls from the epic orchestration,
- * token-guarded by {@link CdTokenFilter} alongside the intake) and the reads. The environment is
- * the aggregate here — applications live inside it, deployments are read via {@code
- * CdDeploymentController} with the environment as a required filter.
+ * The environment surface: creation and teardown (machine calls from the epic orchestration, on
+ * qits-net where callers are trusted; the front door session-guards the paths) and the reads. The
+ * environment is the aggregate here — applications live inside it, deployments are read via
+ * {@code CdDeploymentController} with the environment as a required filter.
  *
  * <p>Deliberately <b>not</b> {@code @Operation(hidden = true)}: unlike the intake, this is the API
  * of this service — the thing a client (human or the epic orchestration) is written against — so it

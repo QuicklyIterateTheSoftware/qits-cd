@@ -20,7 +20,10 @@ import org.eclipse.microprofile.openapi.annotations.Operation;
  * anywhere; deployments just stop happening. The path carries no {@code cd} segment of its own
  * because {@code quarkus.rest.path=/cd/api} already says it.
  *
- * <p>Hidden from the OpenAPI document (a wire/system API); token-guarded by {@link CdTokenFilter}.
+ * <p>Hidden from the OpenAPI document (a wire/system API). Carries no token guard: unlike ci's
+ * intake this path is NOT on the gateway's token-free allowlist — the sender dials it directly on
+ * qits-net, so the front door session-guards it and the network trusts it. If it is ever
+ * allowlisted at the gateway, a write guard here must land in the same change.
  */
 @Path("/events")
 @Produces(MediaType.APPLICATION_JSON)

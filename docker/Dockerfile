@@ -27,19 +27,19 @@
 #     -e QUARKUS_DATASOURCE_CD_JDBC_URL=jdbc:h2:file:/data/cd/h2/cd \
 #     ...
 #
-# Three more have defaults that are wrong QUIETLY — nothing will tell you they are unset:
+# Two more have defaults that are wrong QUIETLY — nothing will tell you they are unset:
 #
 #   QITS_CD_REGISTRY_HOST   where the DOCKER DAEMON pulls images from. The qits-net default
 #                           (qits-artifacts:8080) only resolves for a daemon whose containers sit
 #                           on qits-net, and the daemon must additionally trust it
 #                           (insecure-registries) while the platform speaks plain HTTP. Wrong, every
 #                           deployment records FAILED with a pull error.
-#   QITS_CD_TOKEN           blank means the build-succeeded intake — the one cd path on the
-#                           gateway's token-free allowlist — is unauthenticated there. Must match
-#                           qits-ci's qits.cd.token.
 #   QITS_OBSERVABILITY_URL  where OTLP export goes; absent qits-observability, the exporter logs a
 #                           warning per export loudly enough to bury real lines
 #                           (OTEL_SDK_DISABLED=true is the escape hatch).
+#
+# There is no QITS_CD_TOKEN: nothing of cd is on the gateway's token-free allowlist, so every
+# /cd/* path is session-guarded at the front door, and qits-net callers are trusted.
 #
 # --- READ THIS BEFORE DEPLOYING: cd does its work by shelling out --------------------------------
 # The docker CLI is installed below, but it is only half of what a deployment has to supply, and

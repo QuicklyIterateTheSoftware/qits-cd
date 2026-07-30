@@ -75,15 +75,16 @@ service-to-service calls on qits-net address the same paths.
 | `/cd/api/events/build-succeeded` | POST | the qits-ci intake (hidden from the OpenAPI document) |
 | `/cd/q/openapi`, `/cd/q/swagger-ui` | GET | the API document |
 
-The build-succeeded intake is guarded by the static machine token `X-CD-Token` / `qits.cd.token`,
-blank ⇒ open (dev/test), the `qits.ci.token` pattern exactly — and it is the **only** guarded
-path, for the same single reason ci's intake is: it sits on the gateway's token-free allowlist, so
-the token is its whole write protection at the front door. The environment surface carries no
-token: it is not on the allowlist (the gateway demands a session for it), and on qits-net the
-platform's services are trusted callers — hardening intra-network machine surfaces further is a
-later, platform-wide decision, deliberately not half-solved here. Reads are open. User identity is
-the gateway's `X-Qits-User` header (see `service/…/security/`); this service authenticates nothing
-and authorizes nothing.
+There is **no machine token** in this service, and that is a decision, not an omission. Nothing of
+cd is on the gateway's token-free allowlist, so every `/cd/*` path — the intake included — is
+session-guarded at the front door; on qits-net, callers are trusted, and that is where qits-ci's
+notifier and the epic orchestration actually dial. The `qits.ci.token` pattern exists for paths
+that *are* allowlisted at the gateway (ci's intake is; cd's is not, because its sender never
+traverses the gateway). Hardening intra-network machine surfaces is a later, platform-wide
+decision, deliberately not half-solved here — and if the intake ever needs a session-free
+front-door spelling, the gateway allowlist entry and a write guard here land in the same change.
+User identity is the gateway's `X-Qits-User` header (see `service/…/security/`); this service
+authenticates nothing and authorizes nothing.
 
 The intake is a **fire-and-forget contract**: qits-ci's notifier swallows delivery failures at
 debug, so a path mismatch between the two repos raises no error anywhere and deployments simply
@@ -120,5 +121,5 @@ local native-image; without one Quarkus silently falls back to a container build
 See `docker/Dockerfile`'s header for the whole story. The short form: mount a volume at `/data`,
 set `QUARKUS_DATASOURCE_CD_JDBC_URL=jdbc:h2:file:/data/cd/h2/cd`, mount the docker socket
 (an explicit, root-equivalent decision), set `QITS_CD_REGISTRY_HOST` to where the *daemon* pulls,
-set `QITS_CD_TOKEN`, and put the container on qits-net as `qits-cd`. Then flip the gateway on:
+and put the container on qits-net as `qits-cd`. Then flip the gateway on:
 `QITS_GATEWAY_PROXY_HOSTS_CD=qits-cd`.
