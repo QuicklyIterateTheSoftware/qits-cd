@@ -4,11 +4,13 @@ import eu.wohlben.qits.cd.control.CdIdentifiers;
 import eu.wohlben.qits.cd.control.CdProcess;
 import eu.wohlben.qits.cd.control.DeploymentDriver;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import org.eclipse.microprofile.config.Config;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
@@ -84,6 +86,19 @@ public class DockerDeploymentDriver implements DeploymentDriver {
 
   @ConfigProperty(name = "qits.cd.output-max-chars")
   int outputMaxChars;
+
+  /**
+   * The prefix of the per-application run-argument family: {@code
+   * qits.cd.run-args.<application-name>} holds extra {@code docker run} arguments (volumes, env,
+   * ports — whatever the deployment decides its application needs), whitespace-split and appended
+   * verbatim between cd's own flags and the image reference. Deployment config is the ONLY source
+   * — never the API, never the intake — which is what keeps the trust domain the one that already
+   * holds the docker socket. Package-private for the argv tests.
+   */
+  static final String RUN_ARGS_PREFIX = "qits.cd.run-args.";
+
+  /** Looked up per key rather than {@code @ConfigProperty}: the key carries the application name. */
+  @Inject Config config;
 
   @Override
   public void ensureNetwork(String network) {
@@ -265,6 +280,14 @@ public class DockerDeploymentDriver implements DeploymentDriver {
     // application config (datasources, peers) is the image's and the environment's own story.
     env(argv, "QITS_ENVIRONMENT", spec.environmentName());
     env(argv, "QITS_APPLICATION", spec.applicationName());
+    // The deployment's own additions for this application — qits.cd.run-args.<name>, whitespace
+    // split, no re-quoting (an argument that needs a space in it does not fit this seam). The
+    // application name was already dns-label-validated at the boundary, so the assembled key
+    // cannot escape the family.
+    config
+        .getOptionalValue(RUN_ARGS_PREFIX + spec.applicationName(), String.class)
+        .filter(raw -> !raw.isBlank())
+        .ifPresent(raw -> argv.addAll(Arrays.asList(raw.trim().split("\\s+"))));
     argv.add(spec.imageRef());
     return List.copyOf(argv);
   }

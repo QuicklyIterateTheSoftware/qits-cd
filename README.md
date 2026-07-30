@@ -58,6 +58,17 @@ instances of the same commit's predecessor and successor, the benign case.
   carries `curl` and listens on 8080 — both platform conventions. The default path is
   `/q/health/ready`; an application can name its own (`healthPath` per application — the platform's
   own services would name `/<segment>/q/health/ready`).
+- **Application run arguments come from deployment config, never from the API.**
+  `qits.cd.run-args.<application-name>` holds extra `docker run` arguments for that application —
+  volumes, env, published ports, even a docker socket mount — whitespace-split and appended
+  verbatim between cd's own flags and the image reference (no quoting: an argument that needs a
+  space in it does not fit this seam). In compose that is
+  `QITS_CD_RUN_ARGS_QITS_PROJECTS: "-v qits-projects-data:/data -e QUARKUS_DATASOURCE_PROJECTS_JDBC_URL=..."`.
+  The source matters more than the feature: the environments API is deliberately open on qits-net,
+  so nothing arriving over HTTP may shape a `docker run` argv — these arguments live in the same
+  trust domain as the socket cd already holds, and changing them is a config diff on the
+  deployment, visible like any other. Without an entry a container still gets exactly
+  `QITS_ENVIRONMENT` and `QITS_APPLICATION` and nothing else.
 - **Containers carry labels** (`qits.cd.environment`, `qits.cd.application`,
   `qits.cd.deployment`), and teardown finds them by label — so even containers whose rows are gone
   cannot be orphaned invisibly.
@@ -104,9 +115,11 @@ stop. Both ends pin the literal path and both suites assert the absolute address
   submodule tracking, calling this service on epic start — all of that is qits-projects' side of
   the contract and does not exist yet; this service is the receiving half, complete and testable
   without it.
-- **Application config injection.** A deployed container gets `QITS_ENVIRONMENT` and
-  `QITS_APPLICATION` and nothing else; datasources, peer addresses and secrets are the image's and
-  the environment's own story, not a templating engine here.
+- **A templating engine for application config.** A deployed container gets `QITS_ENVIRONMENT`,
+  `QITS_APPLICATION`, and whatever the deployment's own `qits.cd.run-args.<name>` names (see the
+  conventions above) — cd itself renders nothing, resolves nothing and stores nothing per
+  application beyond that config family. Datasources, peer addresses and secrets stay the image's
+  and the deployment's own story; cd only carries the deployment's words to `docker run`.
 
 ## Building and testing
 

@@ -81,9 +81,17 @@ validation stays at the boundary and the belt stays at the argv.
 
 **cd executes nothing.** Its docker vocabulary is container lifecycle — `pull`, `run`, `inspect`,
 `logs`, `rm`, `ps`, `network create/inspect/rm` — and `exec` is not in it. What a deployed
-container runs is its image's own entrypoint; cd's relationship with it ends at lifecycle. A
-`docker exec`, a host mount, or the docker socket appearing in a *started* container's argv is the
-regression, not a feature.
+container runs is its image's own entrypoint; cd's relationship with it ends at lifecycle.
+
+Mounts and extra env in a *started* container's argv exist, and their source is the invariant
+(rewritten consciously when `qits.cd.run-args.<application>` landed — the same amendment qits-ci's
+"no repo-controlled code gains a docker socket" went through for `docker: true`): they come from
+the **deployment's own config and nowhere else**. Nothing arriving over HTTP — not the create
+request, not the intake — may contribute a token to a `docker run` argv; the API is deliberately
+open on qits-net, and config is the trust domain that already holds the socket.
+`DockerDeploymentDriverTest.runArgsOfAnotherApplicationDoNotLeakIn` asserts the absence as the
+security property. A `docker exec`, or run-args growing an HTTP-writable source, is the
+regression.
 
 ## Addressing
 
