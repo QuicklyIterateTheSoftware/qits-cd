@@ -30,10 +30,17 @@ A deployment that goes wrong is a recorded outcome, never a broken environment:
 | `FAILED` | docker refused, the container died, or the health gate expired — the old container stays |
 | `DECOMMISSIONED` | was ACTIVE; replaced by a newer deployment that passed the gate |
 
-**The cutover invariant:** the old container is removed only after the new one passed the health
-gate. A failed deployment leaves the previous one `ACTIVE` and serving; the fresh container is
-removed. During a cutover both share the network alias briefly — round-robin between two healthy
-instances of the same commit's predecessor and successor, the benign case.
+**The cutover invariant:** the previous container is only *stopped* during the gate and removed
+only after the new one passed it; a failed deployment removes the fresh container and restarts
+what was stopped, so the previous deployment stays `ACTIVE` and serving. Stop-before-start —
+rather than the overlapping cutover this service first shipped — is what makes stateful
+applications deployable at all: one process per H2 file, one binder per published host port. The
+pull happens before the stop, so even the registry's own application can be replaced. The
+predecessor is *whatever holds the application's alias* on the environment's network, including
+containers cd did not start — which is how a bootstrap's compose-seeded originals hand themselves
+over to cd on their first pipeline deployment. The one predecessor cd refuses to stop is its own
+container: the planned self-update mechanism is the successor shutting down the predecessor, and
+until it exists a `qits-cd` deployment records a FAILED row saying exactly that.
 
 ## The conventions this service is made of
 

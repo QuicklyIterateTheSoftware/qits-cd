@@ -141,6 +141,85 @@ public class DockerDeploymentDriver implements DeploymentDriver {
   }
 
   @Override
+  public List<Holder> aliasHolders(String network, String alias) {
+    CdProcess.Result listed =
+        CdProcess.run(
+            null,
+            List.of(runtime, "ps", "-q", "--filter", "network=" + network),
+            CLEANUP_TIMEOUT,
+            8192);
+    if (listed.exitCode() != 0) {
+      LOG.debugf("Could not list containers on '%s': %s", network, listed.output());
+      return List.of();
+    }
+    List<String> ids =
+        Arrays.stream((listed.output() == null ? "" : listed.output()).split("\\R"))
+            .map(String::trim)
+            .filter(id -> !id.isEmpty())
+            .toList();
+    if (ids.isEmpty()) {
+      return List.of();
+    }
+    // One inspect for all of them: id|name|the container's aliases on THIS network. A container's
+    // own name always resolves on a user-defined network, so it counts as an alias here — that is
+    // what lets a replace cutover absorb a predecessor the bootstrap started outside cd.
+    List<String> argv = new ArrayList<>(List.of(runtime, "inspect", "--format",
+        "{{.Id}}|{{.Name}}|{{with (index .NetworkSettings.Networks \"" + network + "\")}}{{range .Aliases}}{{.}} {{end}}{{end}}"));
+    argv.addAll(ids);
+    CdProcess.Result inspected = CdProcess.run(null, argv, CLEANUP_TIMEOUT, outputMaxChars);
+    if (inspected.exitCode() != 0) {
+      LOG.debugf("Could not inspect containers on '%s': %s", network, inspected.output());
+      return List.of();
+    }
+    return parseHolders(inspected.output(), alias);
+  }
+
+  /** Package-private for the parsing test: one `id|/name|alias alias ...` line per container. */
+  static List<Holder> parseHolders(String inspectOutput, String alias) {
+    List<Holder> holders = new ArrayList<>();
+    for (String line : (inspectOutput == null ? "" : inspectOutput).split("\\R")) {
+      String[] parts = line.trim().split("\\|", 3);
+      if (parts.length < 2) {
+        continue;
+      }
+      String name = parts[1].startsWith("/") ? parts[1].substring(1) : parts[1];
+      boolean aliased =
+          parts.length == 3 && Arrays.asList(parts[2].trim().split("\\s+")).contains(alias);
+      if (name.equals(alias) || aliased) {
+        holders.add(new Holder(parts[0], name));
+      }
+    }
+    return List.copyOf(holders);
+  }
+
+  @Override
+  public void stop(String containerName) {
+    CdProcess.Result result =
+        CdProcess.run(null, List.of(runtime, "stop", containerName), RUN_TIMEOUT, 8192);
+    if (result.exitCode() != 0) {
+      LOG.warnf("Could not stop container %s: %s", containerName, result.output());
+    }
+  }
+
+  @Override
+  public void restart(String containerName) {
+    CdProcess.Result result =
+        CdProcess.run(null, List.of(runtime, "start", containerName), RUN_TIMEOUT, 8192);
+    if (result.exitCode() != 0) {
+      LOG.warnf("Could not restart container %s: %s", containerName, result.output());
+    }
+  }
+
+  @Override
+  public String selfContainerId() {
+    try {
+      return java.nio.file.Files.readString(java.nio.file.Path.of("/etc/hostname")).strip();
+    } catch (Exception e) {
+      return "";
+    }
+  }
+
+  @Override
   public StartResult start(StartSpec spec) {
     CdProcess.Result result = CdProcess.run(null, buildArgv(spec), RUN_TIMEOUT, outputMaxChars);
     if (result.exitCode() != 0 || result.timedOut()) {

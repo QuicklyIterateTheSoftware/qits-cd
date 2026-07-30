@@ -58,11 +58,17 @@ asymmetry with qits-ci (whose step containers are ephemeral by definition) is th
 
 ## The cutover invariant
 
-The old container is removed only after the new one passed the health gate; a failed gate removes
-the *fresh* container and leaves the previous deployment ACTIVE. Every removal is a decision
-recorded on a deployment row — a decommission, a failed cutover, a teardown — never a side effect.
-If you change the state machine, `CdDeploymentFlowTest.aFailedHealthGateRemovesTheFreshContainerAndKeepsTheOldOneServing`
-is the test that holds this.
+Replace, not overlap: whatever holds the application's alias is *stopped* before the fresh
+container starts (one process per H2 file, one binder per published port — overlap cannot deploy
+a stateful application), and *removed* only after the new one passed the health gate; a failed
+gate removes the fresh container and **restarts** what was stopped, leaving the previous
+deployment ACTIVE and serving. Pull precedes stop, so the registry's own application is
+replaceable. cd never stops its own container — a `qits-cd` deployment records an honest FAILED
+row until the planned successor-shuts-down-predecessor self-update exists. Every removal is a
+decision recorded on a deployment row — a decommission, a failed cutover, a teardown — never a
+side effect. The tests that hold this:
+`CdDeploymentFlowTest.theReplaceCutoverStopsAliasHoldersBeforeStartingAndRemovesThemAfterTheGate`,
+`.aFailedGateRestartsWhatTheCutoverStopped`, and `.theSelfGuardRefusesToStopItsOwnProcess`.
 
 ## Untrusted input
 

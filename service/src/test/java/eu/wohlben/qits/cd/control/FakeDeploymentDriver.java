@@ -29,10 +29,17 @@ public class FakeDeploymentDriver implements DeploymentDriver {
   private final List<String> awaited = Collections.synchronizedList(new ArrayList<>());
   private final List<String> removedContainers = Collections.synchronizedList(new ArrayList<>());
   private final List<String> removedEnvironments = Collections.synchronizedList(new ArrayList<>());
+  private final List<String> stoppedContainers = Collections.synchronizedList(new ArrayList<>());
+  private final List<String> restartedContainers = Collections.synchronizedList(new ArrayList<>());
+
+  /** Every driver call in arrival order, tagged `kind:target` — the cutover ORDER assertions. */
+  private final List<String> calls = Collections.synchronizedList(new ArrayList<>());
 
   private volatile PullResult nextPull = new PullResult(PullOutcome.OK, null);
   private volatile StartResult nextStart = new StartResult(true, null);
   private volatile HealthResult nextHealth = new HealthResult(true, null);
+  private volatile List<Holder> nextHolders = List.of();
+  private volatile String selfId = "";
 
   public void reset() {
     ensuredNetworks.clear();
@@ -42,9 +49,34 @@ public class FakeDeploymentDriver implements DeploymentDriver {
     awaited.clear();
     removedContainers.clear();
     removedEnvironments.clear();
+    stoppedContainers.clear();
+    restartedContainers.clear();
+    calls.clear();
     nextPull = new PullResult(PullOutcome.OK, null);
     nextStart = new StartResult(true, null);
     nextHealth = new HealthResult(true, null);
+    nextHolders = List.of();
+    selfId = "";
+  }
+
+  public void scriptAliasHolders(List<Holder> holders) {
+    nextHolders = holders;
+  }
+
+  public void scriptSelfId(String id) {
+    selfId = id;
+  }
+
+  public List<String> stoppedContainers() {
+    return List.copyOf(stoppedContainers);
+  }
+
+  public List<String> restartedContainers() {
+    return List.copyOf(restartedContainers);
+  }
+
+  public List<String> calls() {
+    return List.copyOf(calls);
   }
 
   public void scriptPull(PullResult result) {
@@ -104,8 +136,32 @@ public class FakeDeploymentDriver implements DeploymentDriver {
   }
 
   @Override
+  public List<Holder> aliasHolders(String network, String alias) {
+    calls.add("aliasHolders:" + alias);
+    return nextHolders;
+  }
+
+  @Override
+  public void stop(String containerName) {
+    stoppedContainers.add(containerName);
+    calls.add("stop:" + containerName);
+  }
+
+  @Override
+  public void restart(String containerName) {
+    restartedContainers.add(containerName);
+    calls.add("restart:" + containerName);
+  }
+
+  @Override
+  public String selfContainerId() {
+    return selfId;
+  }
+
+  @Override
   public StartResult start(StartSpec spec) {
     started.add(spec);
+    calls.add("start:" + spec.containerName());
     return nextStart;
   }
 
@@ -118,6 +174,7 @@ public class FakeDeploymentDriver implements DeploymentDriver {
   @Override
   public void remove(String containerName) {
     removedContainers.add(containerName);
+    calls.add("remove:" + containerName);
   }
 
   @Override

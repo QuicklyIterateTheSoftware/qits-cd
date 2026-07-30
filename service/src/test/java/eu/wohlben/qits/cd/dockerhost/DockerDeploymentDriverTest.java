@@ -128,6 +128,23 @@ class DockerDeploymentDriverTest {
   }
 
   @Test
+  void aliasHolderParsingMatchesByNameOrAliasAndStripsTheLeadingSlash() {
+    // docker inspect emits /name; a container's own name resolves on the network, so name==alias
+    // counts (the compose-seeded case) as does an explicit --network-alias (cd's own case).
+    String output =
+        "aaa111|/qits-gateway|qits-gateway abc\n"
+            + "bbb222|/qits-cd-qits-qits-gateway-12345678|qits-gateway\n"
+            + "ccc333|/unrelated|other-alias\n";
+    List<DeploymentDriver.Holder> holders =
+        DockerDeploymentDriver.parseHolders(output, "qits-gateway");
+    assertEquals(
+        List.of(
+            new DeploymentDriver.Holder("aaa111", "qits-gateway"),
+            new DeploymentDriver.Holder("bbb222", "qits-cd-qits-qits-gateway-12345678")),
+        holders);
+  }
+
+  @Test
   void aHostileHealthPathCannotReachTheShellString() {
     // Belt on top of the boundary's braces: the one value interpolated into a string a shell will
     // run is re-validated at the last line before the argv.

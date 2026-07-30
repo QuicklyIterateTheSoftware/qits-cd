@@ -15,7 +15,9 @@ import jakarta.inject.Inject;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -33,12 +35,19 @@ import org.jboss.logging.Logger;
  * slow docker work never holds a transaction, and everything the docker calls need is copied out
  * of the entities first — the worker thread has no request context and no open session.
  *
- * <p><b>The cutover invariant:</b> the old container is removed only after the new one passed the
- * health gate. A failed deployment — image missing, docker refused, health gate expired — leaves
- * the previous deployment {@code ACTIVE} and its container running; the fresh container, if one
- * exists by then, is removed. Both containers briefly share the network alias while a cutover is in
- * flight; docker round-robins between two healthy instances of the same application, which is the
- * benign case of the alias-collision hazard the per-environment network exists to prevent.
+ * <p><b>The cutover invariant:</b> the previous container is only <i>stopped</i> during the gate
+ * and is removed only after the new one passed it; a failed deployment — image missing, docker
+ * refused, health gate expired — removes the fresh container and restarts what was stopped, so
+ * the previous deployment stays {@code ACTIVE} and serving. Stop-before-start (rather than the
+ * overlapping cutover this service first shipped) is what makes stateful applications deployable
+ * at all: one process per H2 file, one binder per published host port. The pull still happens
+ * before the stop, so replacing the registry's own application does not depend on the registry
+ * being up mid-cutover. The predecessor is whatever holds the application's alias on the
+ * environment's network — including containers cd did not start (a bootstrap's seeded originals),
+ * which is how the platform's compose-managed first boot hands itself over to cd. The one
+ * predecessor cd refuses to stop is its own container: self-update's planned mechanism is the
+ * successor shutting down the predecessor, and until that exists a qits-cd deployment records a
+ * FAILED row saying so.
  */
 @ApplicationScoped
 public class DeployService {
@@ -222,6 +231,35 @@ public class DeployService {
     // The network is re-ensured on every deployment rather than trusted from creation time — an
     // environment created while docker was down must heal, not stay broken.
     driver.ensureNetwork(plan.network());
+
+    // The replace cutover: whatever currently answers to the application's alias is STOPPED —
+    // not removed — before the fresh container starts. Stopping first is what makes stateful
+    // applications deployable at all (one process per H2 file, one binder per published host
+    // port); keeping the stopped containers around is what preserves the rollback: a failed gate
+    // restarts them. This also absorbs predecessors cd did not start (the bootstrap's seeded
+    // originals) — holding the alias is what makes something the predecessor, not a row here.
+    List<DeploymentDriver.Holder> predecessors =
+        driver.aliasHolders(plan.network(), plan.applicationName());
+    String self = driver.selfContainerId();
+    if (!self.isBlank()
+        && predecessors.stream().anyMatch(p -> p.id().startsWith(self) || self.startsWith(p.id()))) {
+      // Stopping the predecessor would stop the process performing this deployment. The intended
+      // mechanism — the successor shuts down its predecessor — is planned, not built; record the
+      // honest outcome instead of a half-executed cutover.
+      finish(
+          deploymentId,
+          CdDeploymentStatus.FAILED,
+          "[self-update: the alias '"
+              + plan.applicationName()
+              + "' is held by the qits-cd instance performing this deployment. The planned"
+              + " mechanism (the successor shuts down its predecessor) is not implemented yet —"
+              + " until it is, redeploy qits-cd from the bootstrap]");
+      return;
+    }
+    for (DeploymentDriver.Holder predecessor : predecessors) {
+      driver.stop(predecessor.name());
+    }
+
     DeploymentDriver.StartResult started =
         driver.start(
             new DeploymentDriver.StartSpec(
@@ -236,6 +274,7 @@ public class DeployService {
                 plan.healthPath()));
     if (!started.started()) {
       driver.remove(containerName); // in case docker created it and then failed
+      rollback(predecessors);
       finish(deploymentId, CdDeploymentStatus.FAILED, safe(started.detail()));
       return;
     }
@@ -243,14 +282,17 @@ public class DeployService {
     DeploymentDriver.HealthResult health =
         driver.awaitHealthy(containerName, Duration.ofSeconds(healthTimeoutSeconds));
     if (!health.healthy()) {
-      // The fresh container failed the gate: remove IT and leave the previous deployment serving.
+      // The fresh container failed the gate: remove IT and restart what the cutover stopped —
+      // the previous deployment goes back to serving.
       driver.remove(containerName);
+      rollback(predecessors);
       finish(deploymentId, CdDeploymentStatus.FAILED, safe(health.detail()));
       return;
     }
 
     // Cutover: the new deployment is the application's ACTIVE one, whatever was ACTIVE before is
-    // decommissioned — rows first, then the old containers.
+    // decommissioned — rows first, then the stopped containers (rows' and alias-holders' alike;
+    // a set, since the healthy path sees most containers from both angles).
     List<String> oldContainers =
         QuarkusTransaction.requiringNew()
             .call(
@@ -268,12 +310,23 @@ public class DeployService {
                   deployment.finishedAt = Instant.now();
                   return old;
                 });
-    for (String oldContainer : oldContainers) {
+    Set<String> toRemove = new LinkedHashSet<>(oldContainers);
+    for (DeploymentDriver.Holder predecessor : predecessors) {
+      toRemove.add(predecessor.name());
+    }
+    for (String oldContainer : toRemove) {
       driver.remove(oldContainer);
     }
     LOG.infof(
         "Deployed %s@%s into %s (%s)",
         plan.applicationName(), plan.sha(), plan.environmentName(), containerName);
+  }
+
+  /** A failed cutover restarts every container it stopped — the previous deployment serves again. */
+  private void rollback(List<DeploymentDriver.Holder> predecessors) {
+    for (DeploymentDriver.Holder predecessor : predecessors) {
+      driver.restart(predecessor.name());
+    }
   }
 
   private void finish(String deploymentId, CdDeploymentStatus status, String detail) {

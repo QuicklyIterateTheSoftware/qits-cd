@@ -1,6 +1,7 @@
 package eu.wohlben.qits.cd.control;
 
 import java.time.Duration;
+import java.util.List;
 
 /**
  * The seam between cd's orchestration and the host's docker daemon — the {@code CiStepRunner}
@@ -22,6 +23,25 @@ public interface DeploymentDriver {
   /** {@code docker pull} the reference so a missing image is its own recorded outcome. */
   PullResult pull(String imageRef);
 
+  /**
+   * The containers currently answering to the application's alias on the environment's network —
+   * the predecessors a replace cutover stops, whoever started them: a prior deployment, or an
+   * original this platform's bootstrap seeded outside cd.
+   */
+  List<Holder> aliasHolders(String network, String alias);
+
+  /** Stop the container, leaving it restartable — the first half of the replace cutover. */
+  void stop(String containerName);
+
+  /** Start a container {@link #stop} left behind — the rollback of a failed gate. */
+  void restart(String containerName);
+
+  /**
+   * This process's own container id ({@code /etc/hostname} in a container), blank when unknown —
+   * the self-update guard: cd must never stop the instance performing the deployment.
+   */
+  String selfContainerId();
+
   /** Start the container, detached, on the environment's network. The image's entrypoint runs. */
   StartResult start(StartSpec spec);
 
@@ -36,6 +56,9 @@ public interface DeploymentDriver {
 
   /** Remove every container labelled as belonging to the environment. Returns how many there were. */
   int removeEnvironmentContainers(String environmentId);
+
+  /** One container holding an application's alias: the full docker id and the container name. */
+  record Holder(String id, String name) {}
 
   /** Everything one container is started with. */
   record StartSpec(

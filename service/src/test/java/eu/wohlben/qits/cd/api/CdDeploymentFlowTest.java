@@ -183,6 +183,60 @@ public class CdDeploymentFlowTest {
   }
 
   @Test
+  public void theReplaceCutoverStopsAliasHoldersBeforeStartingAndRemovesThemAfterTheGate() {
+    // The predecessor here is NOT one of cd's own rows — it is whatever holds the alias, which is
+    // how the compose-seeded originals hand over to cd on their first pipeline deployment.
+    String environmentId = createEnvironment("flow-replace", "repo-replace", "app-replace");
+    driver.scriptAliasHolders(List.of(new DeploymentDriver.Holder("c0ffee".repeat(10) + "beef", "seeded-original")));
+    postBuildSucceeded("repo-replace", "epic/flow-replace", SHA_A);
+
+    List<Map<String, Object>> deployments = awaitDeployments(environmentId, 1);
+    assertEquals("ACTIVE", deployments.get(0).get("status"));
+    assertEquals(List.of("seeded-original"), driver.stoppedContainers());
+    assertEquals(List.of("seeded-original"), driver.removedContainers());
+    assertEquals(List.of(), driver.restartedContainers());
+    // The order IS the feature: stopped before the fresh start, removed only after the gate.
+    List<String> calls = driver.calls();
+    assertTrue(
+        calls.indexOf("stop:seeded-original") < calls.indexOf("start:" + driver.started().get(0).containerName())
+            && calls.indexOf("remove:seeded-original") > calls.indexOf("start:" + driver.started().get(0).containerName()),
+        "stop < start < remove, got " + calls);
+  }
+
+  @Test
+  public void aFailedGateRestartsWhatTheCutoverStopped() {
+    String environmentId = createEnvironment("flow-rollback", "repo-rollback", "app-rollback");
+    driver.scriptAliasHolders(List.of(new DeploymentDriver.Holder("dead".repeat(16), "previous-app")));
+    driver.scriptHealth(new DeploymentDriver.HealthResult(false, "container exited"));
+    postBuildSucceeded("repo-rollback", "epic/flow-rollback", SHA_A);
+
+    List<Map<String, Object>> deployments = awaitDeployments(environmentId, 1);
+    assertEquals("FAILED", deployments.get(0).get("status"));
+    assertEquals(List.of("previous-app"), driver.stoppedContainers());
+    assertEquals(List.of("previous-app"), driver.restartedContainers());
+    // Removed: only the fresh container that failed its gate — never the restarted predecessor.
+    assertEquals(List.of(driver.started().get(0).containerName()), driver.removedContainers());
+  }
+
+  @Test
+  public void theSelfGuardRefusesToStopItsOwnProcess() {
+    // Deploying the application whose alias this very instance holds: the planned successor-kills-
+    // predecessor mechanism does not exist yet, so the deployment records the honest FAILED row
+    // and stops NOTHING — a half-executed self-cutover would take the deployer down mid-flight.
+    String environmentId = createEnvironment("flow-self", "repo-self", "qits-cd");
+    String selfId = "abcdef123456";
+    driver.scriptSelfId(selfId);
+    driver.scriptAliasHolders(List.of(new DeploymentDriver.Holder(selfId + "f".repeat(52), "qits-cd")));
+    postBuildSucceeded("repo-self", "epic/flow-self", SHA_A);
+
+    List<Map<String, Object>> deployments = awaitDeployments(environmentId, 1);
+    assertEquals("FAILED", deployments.get(0).get("status"));
+    assertTrue(((String) deployments.get(0).get("detail")).contains("self-update"));
+    assertEquals(List.of(), driver.stoppedContainers());
+    assertEquals(List.of(), driver.started().stream().map(DeploymentDriver.StartSpec::containerName).toList());
+  }
+
+  @Test
   public void aBranchWithoutAnEnvironmentDeploysNothing() {
     String environmentId = createEnvironment("flow-other", "repo-other", "app-other");
     // Same repo, different branch; and a different repo on the listened branch.
