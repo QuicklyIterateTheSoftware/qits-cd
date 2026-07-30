@@ -10,6 +10,12 @@ steps:
     docker: true
     timeout-seconds: 3600
     script: |
+      # The daemon runs this with `bash -c` and no -e, so without this a failed docker build is
+      # swallowed: the push fails, `docker rmi || true` answers 0, the run reports SUCCESS, and cd
+      # is told an image exists that does not (the exact shape of the qits-workspaces
+      # IMAGE_MISSING incident). -u makes an unset registry variable stop the step too.
+      set -eu
+
       ref="$QITS_REGISTRY/$QITS_IMAGE_REPOSITORY/qits-cd:$QITS_CI_SHA"
       docker build -t "$ref" -f docker/Dockerfile .
       docker push "$ref"
