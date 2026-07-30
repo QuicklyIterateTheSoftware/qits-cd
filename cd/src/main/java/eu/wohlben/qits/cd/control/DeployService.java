@@ -49,10 +49,10 @@ public class DeployService {
   @Inject CdDeploymentRepository deployments;
   @Inject DeploymentDriver driver;
 
-  @ConfigProperty(name = "qits.cd.registry-host")
+  @ConfigProperty(name = "qits.artifacts.registry-host")
   String registryHost;
 
-  @ConfigProperty(name = "qits.cd.image-repository")
+  @ConfigProperty(name = "qits.artifacts.image-repository")
   String imageRepository;
 
   @ConfigProperty(name = "qits.cd.default-health-path")

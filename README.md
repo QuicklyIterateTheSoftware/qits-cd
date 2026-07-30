@@ -37,13 +37,15 @@ instances of the same commit's predecessor and successor, the benign case.
 
 ## The conventions this service is made of
 
-- **Image reference**: `<qits.cd.registry-host>/<qits.cd.image-repository>/<application>:<sha>`,
-  shipped as `qits-artifacts:8080/qits/<application>:<commit-sha>`. Nothing in the build
-  notification names an image — cd derives the reference, which makes the tag a contract the
-  publisher has to meet. **Nothing in the platform publishes application images yet** (qits-ci
-  steps get no docker socket by design), so today every deployment of a real build records
-  `IMAGE_MISSING`. That is the honest state, and it indicts the publishing gap, not the build; the
-  unprivileged-builder story is the missing piece and lives upstream of this repo.
+- **Image reference**:
+  `<qits.artifacts.registry-host>/<qits.artifacts.image-repository>/<application>:<sha>`, shipped as
+  `qits-artifacts:8080/qits/<application>:<commit-sha>`. The keys are named after their owner —
+  qits-artifacts' registry — and qits-ci ships the same two, injecting them into pipeline step
+  containers as `QITS_REGISTRY` / `QITS_IMAGE_REPOSITORY`. Nothing in the build notification names
+  an image — cd derives the reference, which makes the tag a contract the publisher has to meet.
+  Publishing is a repository's own last pipeline step (a `docker: true` step in qits-ci, tagging
+  exactly this reference), so `IMAGE_MISSING` means that repository's pipeline publishes nothing or
+  its tag broke the convention — not that nothing can publish.
 - **One network per environment** (`qits-env-<name>`): two environments' stacks must never resolve
   each other's aliases. This is the documented two-stacks-collide-on-`qits-net` failure, avoided by
   construction rather than by discipline.
@@ -120,6 +122,7 @@ local native-image; without one Quarkus silently falls back to a container build
 
 See `docker/Dockerfile`'s header for the whole story. The short form: mount a volume at `/data`,
 set `QUARKUS_DATASOURCE_CD_JDBC_URL=jdbc:h2:file:/data/cd/h2/cd`, mount the docker socket
-(an explicit, root-equivalent decision), set `QITS_CD_REGISTRY_HOST` to where the *daemon* pulls,
+(an explicit, root-equivalent decision), set `QITS_ARTIFACTS_REGISTRY_HOST` to where the *daemon*
+pulls,
 and put the container on qits-net as `qits-cd`. Then flip the gateway on:
 `QITS_GATEWAY_PROXY_HOSTS_CD=qits-cd`.

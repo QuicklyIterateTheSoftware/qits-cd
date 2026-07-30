@@ -13,8 +13,9 @@ public enum CdDeploymentStatus {
   ACTIVE,
   /**
    * The registry has no image for this (application, sha) — the honest name for "CI went green but
-   * nothing published an image", which stays a distinct state because it indicts the publishing
-   * convention rather than the build.
+   * no image arrived", which stays a distinct state because it indicts the publishing convention
+   * rather than the build. Publishing is a repository's own last pipeline step, so this state means
+   * that pipeline publishes nothing or its tag broke the convention.
    */
   IMAGE_MISSING,
   /** Docker refused, the container died, or the health gate expired. The old container stays. */

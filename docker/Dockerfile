@@ -29,7 +29,8 @@
 #
 # Two more have defaults that are wrong QUIETLY — nothing will tell you they are unset:
 #
-#   QITS_CD_REGISTRY_HOST   where the DOCKER DAEMON pulls images from. The qits-net default
+#   QITS_ARTIFACTS_REGISTRY_HOST
+#                           where the DOCKER DAEMON pulls images from. The qits-net default
 #                           (qits-artifacts:8080) only resolves for a daemon whose containers sit
 #                           on qits-net, and the daemon must additionally trust it
 #                           (insecure-registries) while the platform speaks plain HTTP. Wrong, every
