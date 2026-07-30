@@ -1,1 +1,119 @@
 # qits-cd
+
+Continuous deployment for the platform's own services: environments, health-gated cutover, and the
+convention that turns a green build into a running container.
+
+## What it does
+
+An **environment** is a name (by convention an epic's slug), a branch, a docker network, and the
+applications it tracks. The intended lifecycle, end to end:
+
+1. qits-projects starts an epic and creates an environment here — `POST /cd/api/environments`
+   with the epic's slug and the participating repositories. Conventions fill the rest: the branch
+   is `epic/<name>`, the network is `qits-env-<name>`.
+2. Pushes to `epic/<name>` reach the git host, qits-ci builds them, and on a green run notifies
+   this service — `POST /cd/api/events/build-succeeded` with `{runId, repoId, branch, commitSha}`.
+3. cd matches (repoId, branch) against its environments. For each tracked application it records a
+   deployment and, on its worker: derives the image reference by convention
+   (`<registry>/qits/<application>:<sha>`), pulls it, starts it on the environment's network with a
+   docker-native health gate, and — only once the fresh container reports healthy — decommissions
+   the container it replaces.
+4. Epic done, qits-projects deletes the environment: rows, containers, network.
+
+A deployment that goes wrong is a recorded outcome, never a broken environment:
+
+| status | meaning |
+|---|---|
+| `QUEUED` / `STARTING` | in flight (neither survives a restart; a startup sweep fails them) |
+| `ACTIVE` | passed the health gate; its container serves the application |
+| `IMAGE_MISSING` | the registry has no `qits/<application>:<sha>` — CI was green but nothing published an image |
+| `FAILED` | docker refused, the container died, or the health gate expired — the old container stays |
+| `DECOMMISSIONED` | was ACTIVE; replaced by a newer deployment that passed the gate |
+
+**The cutover invariant:** the old container is removed only after the new one passed the health
+gate. A failed deployment leaves the previous one `ACTIVE` and serving; the fresh container is
+removed. During a cutover both share the network alias briefly — round-robin between two healthy
+instances of the same commit's predecessor and successor, the benign case.
+
+## The conventions this service is made of
+
+- **Image reference**: `<qits.cd.registry-host>/<qits.cd.image-repository>/<application>:<sha>`,
+  shipped as `qits-artifacts:8080/qits/<application>:<commit-sha>`. Nothing in the build
+  notification names an image — cd derives the reference, which makes the tag a contract the
+  publisher has to meet. **Nothing in the platform publishes application images yet** (qits-ci
+  steps get no docker socket by design), so today every deployment of a real build records
+  `IMAGE_MISSING`. That is the honest state, and it indicts the publishing gap, not the build; the
+  unprivileged-builder story is the missing piece and lives upstream of this repo.
+- **One network per environment** (`qits-env-<name>`): two environments' stacks must never resolve
+  each other's aliases. This is the documented two-stacks-collide-on-`qits-net` failure, avoided by
+  construction rather than by discipline.
+- **The network alias is the application name** and stays stable across deployments while
+  container names (`qits-cd-<env>-<app>-<deployment-prefix>`) do not. Peers inside an environment
+  address each other by application name, exactly as the platform's compose files do on qits-net.
+- **The health gate runs inside the container** (`--health-cmd` curl'ing
+  `http://localhost:8080<path>`, polled via `docker inspect`): cd never joins an environment's
+  network, so the probe has to live where the network is. The image contract that buys: the image
+  carries `curl` and listens on 8080 — both platform conventions. The default path is
+  `/q/health/ready`; an application can name its own (`healthPath` per application — the platform's
+  own services would name `/<segment>/q/health/ready`).
+- **Containers carry labels** (`qits.cd.environment`, `qits.cd.application`,
+  `qits.cd.deployment`), and teardown finds them by label — so even containers whose rows are gone
+  cannot be orphaned invisibly.
+- **Deployed containers outlive the deployer**: `--restart unless-stopped`, and a qits-cd restart
+  reaps nothing. The startup sweep fails in-flight *rows*; whatever was ACTIVE keeps serving.
+
+## HTTP surface
+
+Everything lives under `/cd/api` (`quarkus.rest.path`); qits-gateway routes `/cd/*` verbatim, and
+service-to-service calls on qits-net address the same paths.
+
+| Path | Verbs | What |
+|---|---|---|
+| `/cd/api/environments` | GET, POST | list; create (machine call from the epic orchestration) |
+| `/cd/api/environments/{id}` | GET, DELETE | one environment with its applications; teardown |
+| `/cd/api/deployments?environmentId=` | GET | an environment's deployments, newest-first |
+| `/cd/api/events/build-succeeded` | POST | the qits-ci intake (hidden from the OpenAPI document) |
+| `/cd/q/openapi`, `/cd/q/swagger-ui` | GET | the API document |
+
+Writes (the intake **and** the environment lifecycle — both move containers on the host) are
+guarded by the static machine token `X-CD-Token` / `qits.cd.token`, blank ⇒ open (dev/test), the
+`qits.ci.token` pattern exactly. Reads are open. User identity is the gateway's `X-Qits-User`
+header (see `service/…/security/`); this service authenticates nothing and authorizes nothing.
+
+The intake is a **fire-and-forget contract**: qits-ci's notifier swallows delivery failures at
+debug, so a path mismatch between the two repos raises no error anywhere and deployments simply
+stop. Both ends pin the literal path and both suites assert the absolute address.
+
+## What is deliberately not here
+
+- **Building or publishing images.** cd consumes the OCI registry; producing for it is the
+  publisher's story. A green build with no image is `IMAGE_MISSING`, loudly.
+- **DNS wiring.** qits-dns's plan names cd as the caller that will wire
+  `<epic>.qits-dev.eu` on deploy (`PUT /dns/api/zones/{id}/records`, idempotent by design). That
+  is a natural next seam here — after the more basic question of how a per-environment hostname
+  becomes a reachable listener (the shared gateway routes by path, not Host) is settled.
+- **The epic orchestration itself.** Creating `epic/<slug>` branches, switching a wrapper repo's
+  submodule tracking, calling this service on epic start — all of that is qits-projects' side of
+  the contract and does not exist yet; this service is the receiving half, complete and testable
+  without it.
+- **Application config injection.** A deployed container gets `QITS_ENVIRONMENT` and
+  `QITS_APPLICATION` and nothing else; datasources, peer addresses and secrets are the image's and
+  the environment's own story, not a templating engine here.
+
+## Building and testing
+
+    ./mvnw verify                 # the gate: green on a clone, no docker, no credentials
+    ./mvnw verify -DskipITs=false # + CdPackagedSurfaceIT against the packaged fast-jar
+    ./mvnw verify -Dnative        # native binary (service/target/qits-cd) + the IT against it
+
+The one seam that needs docker is faked in the suites (`FakeDeploymentDriver`); the docker CLI is
+only ever exercised in a real deployment. `sdk env` (`.sdkmanrc`, GraalVM 25) gives `-Dnative` a
+local native-image; without one Quarkus silently falls back to a container build — grep the log.
+
+## Deploying it
+
+See `docker/Dockerfile`'s header for the whole story. The short form: mount a volume at `/data`,
+set `QUARKUS_DATASOURCE_CD_JDBC_URL=jdbc:h2:file:/data/cd/h2/cd`, mount the docker socket
+(an explicit, root-equivalent decision), set `QITS_CD_REGISTRY_HOST` to where the *daemon* pulls,
+set `QITS_CD_TOKEN`, and put the container on qits-net as `qits-cd`. Then flip the gateway on:
+`QITS_GATEWAY_PROXY_HOSTS_CD=qits-cd`.

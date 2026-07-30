@@ -1,0 +1,155 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>eu.wohlben.qits</groupId>
+        <artifactId>qits-cd</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <!-- The cd REST boundary and the docker seam: `eu.wohlben.qits.cd.api` (the environment
+         surface, the build-succeeded intake, the static-token filter over the write surface, the
+         CdException -> HTTP mapper), `security` (the forward-auth header identity), and
+         `dockerhost` (DockerDeploymentDriver — the sole implementation of the DeploymentDriver
+         seam, kept here because it is cd's whole relationship with the host's docker daemon).
+
+         A DEPLOYABLE APP, not a library JAR — <packaging>quarkus</packaging> binds augmentation
+         into the lifecycle so it cannot be silently misplaced (the migration-deployables-plan.md
+         reasoning, verbatim from the siblings). -->
+    <artifactId>qits-cd-service</artifactId>
+    <name>qits-cd :: service</name>
+    <packaging>quarkus</packaging>
+
+    <dependencies>
+        <dependency>
+            <groupId>${project.groupId}</groupId>
+            <artifactId>qits-cd-domain</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-arc</artifactId>
+        </dependency>
+        <dependency>
+            <!-- OTLP export to qits-observability. The extension is what instruments the process;
+                 the endpoint and protocol in application.properties are what make it arrive, since
+                 the defaults are gRPC to localhost:4317 and the receiver speaks HTTP/protobuf. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-opentelemetry</artifactId>
+        </dependency>
+        <dependency>
+            <!-- SecurityIdentity + the HttpAuthenticationMechanism SPI, for the single thing this
+                 service does about auth: read qits-gateway's X-Qits-User header into an identity
+                 (see security/ForwardAuthMechanism). Authentication terminates at the gateway. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-security</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-rest-jackson</artifactId>
+        </dependency>
+        <dependency>
+            <!-- @Valid on the intake and environment payloads. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-hibernate-validator</artifactId>
+        </dependency>
+        <dependency>
+            <!-- @Operation(hidden = true): the build-succeeded intake is a wire/system API and
+                 stays out of the OpenAPI document; the environment surface is the API and does
+                 not. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-smallrye-openapi</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-junit5</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.rest-assured</groupId>
+            <artifactId>rest-assured</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <!-- This module is the DEPLOYABLE, not a library jar, and <packaging>quarkus</packaging>
+                     above is what says so: it binds generate-code, generate-code-tests and build into
+                     the lifecycle, so augmentation stops being an execution block that can be
+                     misplaced. Requires <extensions>true</extensions>; drop it and the build stops at
+                     "Unknown packaging: quarkus" rather than failing quietly. Version comes from the
+                     root pom's pluginManagement. -->
+                <groupId>${quarkus.platform.group-id}</groupId>
+                <artifactId>quarkus-maven-plugin</artifactId>
+                <extensions>true</extensions>
+            </plugin>
+            <plugin>
+                <artifactId>maven-compiler-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <!-- CdPackagedSurfaceIT binds here. skipITs=true is the parent's default, so a fresh
+                     clone's `mvn verify` is green; `-DskipITs=false` runs it against the fast-jar and
+                     the `native` profile flips it to run against the binary. -->
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <systemPropertyVariables>
+                        <!-- How @QuarkusIntegrationTest finds the compiled binary in a `-Dnative`
+                             build; without it the native run has nothing to launch. The name is
+                             `quarkus.package.output-name` from application.properties, NOT maven's
+                             finalName — with an output-name set, ${project.build.finalName}-runner
+                             is a path that does not exist, and failsafe would silently launch
+                             nothing. The two spellings move together. -->
+                        <native.image.path>${project.build.directory}/qits-cd</native.image.path>
+                        <!-- Launch the packaged app on a free port instead of the default 8081 —
+                             the @QuarkusTest port, which surefire's last Quarkus instance can still
+                             hold when failsafe starts. 0 is understood by the launcher: it reads
+                             the actual port back out of the startup line. -->
+                        <quarkus.http.test-port>0</quarkus.http.test-port>
+                        <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>io.smallrye</groupId>
+                <artifactId>jandex-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <!-- GraalVM native build (the profile every deployable sibling carries): `-Dnative` turns
+             the fast-jar off and the native image on. It lives in THIS module, not the root pom,
+             because only this module is an application — `cd` is a library jar with nothing to
+             native-compile. skipITs flips with it so the build runs CdPackagedSurfaceIT against the
+             binary it just produced rather than packaging one nobody starts. -->
+        <profile>
+            <id>native</id>
+            <activation>
+                <property>
+                    <name>native</name>
+                </property>
+            </activation>
+            <properties>
+                <quarkus.package.jar.enabled>false</quarkus.package.jar.enabled>
+                <skipITs>false</skipITs>
+                <quarkus.native.enabled>true</quarkus.native.enabled>
+            </properties>
+        </profile>
+    </profiles>
+</project>
