@@ -31,6 +31,16 @@ public class CdDeployment extends PanacheEntityBase {
   @Column(name = "commit_sha", nullable = false, length = 64)
   public String commitSha;
 
+  /**
+   * The qits-ci run whose green build caused this deployment, as the intake received it — cd's one
+   * pointer back into the pipeline that produced the image, and nothing it ever resolves itself (no
+   * FK, the repo_id stance). Null on every row recorded before V2, on a sender that omits it, and on
+   * anything cd queued for itself while running an older build; a reader must render that absence
+   * rather than invent a link.
+   */
+  @Column(name = "run_id")
+  public String runId;
+
   @Enumerated(EnumType.STRING)
   @Column(nullable = false, length = 32)
   public CdDeploymentStatus status;

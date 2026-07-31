@@ -153,8 +153,14 @@ public class DeployService {
    * The async entry the build-succeeded intake calls — returns immediately with how many
    * deployments were queued (zero when no environment listens to the branch, which is the normal
    * case for every push to a branch without an environment and not worth an error).
+   *
+   * <p>{@code runId} is optional and is recorded on every row this queues, verbatim: it is the only
+   * pointer from a deployment back to the build that caused it, and cd resolves it against nothing —
+   * a reader takes it to qits-ci. The triple that actually drives the deployment is still (repoId,
+   * branch, commitSha).
    */
-  public int onBuildSucceeded(String repoId, String branch, String commitSha) {
+  public int onBuildSucceeded(String runId, String repoId, String branch, String commitSha) {
+    CdIdentifiers.requireRunId(runId);
     CdIdentifiers.requireRepoId(repoId);
     CdIdentifiers.requireBranch(branch);
     CdIdentifiers.requireSha(commitSha);
@@ -169,6 +175,7 @@ public class DeployService {
                     deployment.id = UUID.randomUUID().toString();
                     deployment.application = app;
                     deployment.commitSha = commitSha;
+                    deployment.runId = runId;
                     deployment.status = CdDeploymentStatus.QUEUED;
                     deployment.createdAt = Instant.now();
                     deployments.persist(deployment);

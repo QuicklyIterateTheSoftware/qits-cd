@@ -13,6 +13,10 @@ import eu.wohlben.qits.cd.error.BadRequestException;
  * <p>Defence in depth, not the only guard: argvs are assembled for {@link ProcessBuilder}, which
  * never re-splits — but the health command IS a shell string the container runs, so {@link
  * #requireHealthPath} is deliberately the strictest check here rather than a formality.
+ *
+ * <p>{@link #requireRunId} is the one exception to the sentence above and says so in its own
+ * javadoc: it reaches no argv, and is bounded here only so a hostile length cannot break the
+ * intake's insert.
  */
 public final class CdIdentifiers {
 
@@ -24,6 +28,9 @@ public final class CdIdentifiers {
 
   /** Conservative subset of valid ref names — enough for real branches, hostile to nothing else. */
   private static final String BRANCH = "[A-Za-z0-9._][A-Za-z0-9._/-]{0,254}";
+
+  /** A foreign opaque id: qits-ci's run ids are UUIDs, and this is wide enough to stay so. */
+  private static final String RUN_ID = "[A-Za-z0-9][A-Za-z0-9._-]{0,63}";
 
   /**
    * dns-safe lowercase slug: environment and application names become docker network names, network
@@ -73,6 +80,28 @@ public final class CdIdentifiers {
       throw new BadRequestException("Invalid branch name");
     }
     return branch;
+  }
+
+  /**
+   * The causing ci run, which is <b>optional</b> — a sender that omits it records a deployment with
+   * no build to point at, which is exactly what every row before V2 looks like.
+   *
+   * <p>This is the one check here that guards no argv and no shell string: the run id is stored and
+   * displayed, nothing more. It exists because the column is bounded — an oversized value would fail
+   * the intake's insert, and the sender is fire-and-forget, so the deployment would simply never
+   * happen and no one would be told why. Bounding it at the boundary turns that into a 400 the
+   * sender's log can show.
+   *
+   * @throws BadRequestException if a present run id is not a plain opaque identifier
+   */
+  public static String requireRunId(String runId) {
+    if (runId == null) {
+      return null;
+    }
+    if (!runId.matches(RUN_ID)) {
+      throw new BadRequestException("Invalid run id");
+    }
+    return runId;
   }
 
   /**

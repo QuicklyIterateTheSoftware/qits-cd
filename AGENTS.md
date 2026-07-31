@@ -22,9 +22,12 @@ right because the clone rule now has two halves (`git clone … && git submodule
   service, not a wart of this one; `docs/project-setup-quinoa-angular.md` in the superproject
   states it correctly.
 
-On the deployment host the default `@QuarkusTest` port 8081 is the platform's own npm registry, so
-a suite run there wants `-Dquarkus.http.test-port=18081` or another free port. (Failsafe already
-launches the packaged artifact on port 0; see `service/pom.xml`.)
+Neither command needs a port argument any more: `service/src/test/resources/application.properties`
+sets `quarkus.http.test-port=0`, so the suite takes a free port instead of Quarkus' default 8081 —
+which on the deployment host is the platform's own npm registry, and which `@QuarkusTest` restarts
+race each other for anywhere. Failsafe passes the same 0 to the packaged artifact (`service/pom.xml`),
+and the siblings carry both lines. `-Dquarkus.http.test-port=18081` is no longer needed and no longer
+documented as a workaround.
 
 **`service/` compiles to a GraalVM native image** — the same rule every deployable sibling
 carries. `.sdkmanrc` names `25.0.2-graalce`, so `sdk env` gives you a `native-image` and

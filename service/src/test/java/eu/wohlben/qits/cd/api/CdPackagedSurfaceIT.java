@@ -24,9 +24,10 @@ import org.junit.jupiter.api.Test;
  * <ul>
  *   <li>the routes are where the config says — {@code quarkus.rest.path} and {@code
  *       quarkus.http.non-application-root-path} are build-time settings baked into the artifact;
- *   <li>the shipped datasource default connects and {@code db/cd/migration/V1__init.sql} survived
- *       as a resource — a migration is loaded by scanning a classpath location, exactly the shape
- *       native-image drops;
+ *   <li>the shipped datasource default connects and {@code db/cd/migration/} survived as a resource
+ *       — migrations are loaded by scanning a classpath location, exactly the shape native-image
+ *       drops, and the lineage is asserted to its <b>head</b> (V2's {@code run_id} is read back off
+ *       a real row) rather than to whatever V1 alone would already satisfy;
  *   <li>an environment round-trips through Hibernate/Panache in the packaged process.
  * </ul>
  *
@@ -209,6 +210,49 @@ public class CdPackagedSurfaceIT {
     assertTrue(
         Files.isDirectory(PackagedUnderTarget.HOME.resolve(".qits/data/cd/h2")),
         "the shipped file-H2 default must be what the packaged process opened");
+  }
+
+  @Test
+  public void theIntakeRecordsTheRunIdAgainstTheShippedSchema() {
+    // V2 added cd_deployment.run_id, and a migration that did not make it into the artifact shows
+    // up exactly here: the intake's insert is the first write that names the column. No docker is
+    // needed — the row is created QUEUED by the request thread, and the worker's pull against a
+    // runtime that does not exist only decides how the row ENDS, not whether it carries the run.
+    String environmentId =
+        given()
+            .contentType(ContentType.JSON)
+            .body(
+                Map.of(
+                    "name", "packaged-runid",
+                    "branch", "main",
+                    "applications",
+                        List.of(Map.of("repoId", "packaged-runid-repo", "name", "packaged-runid-app"))))
+            .when()
+            .post("/cd/api/environments")
+            .then()
+            .statusCode(201)
+            .extract()
+            .path("environment.id");
+
+    given()
+        .contentType(ContentType.JSON)
+        .body(
+            Map.of(
+                "runId", "6f31a0c4-1c2b-4f7a-9b03-2ee45c1f8d61",
+                "repoId", "packaged-runid-repo",
+                "branch", "main",
+                "commitSha", "a".repeat(40)))
+        .when()
+        .post("/cd/api/events/build-succeeded")
+        .then()
+        .statusCode(202);
+
+    given()
+        .when()
+        .get("/cd/api/deployments?environmentId=" + environmentId)
+        .then()
+        .statusCode(200)
+        .body("deployments[0].runId", org.hamcrest.Matchers.equalTo("6f31a0c4-1c2b-4f7a-9b03-2ee45c1f8d61"));
   }
 
   private static void deleteRecursively(Path root) {

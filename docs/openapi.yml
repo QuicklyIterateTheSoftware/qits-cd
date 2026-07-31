@@ -42,6 +42,8 @@ components:
           type: string
         commitSha:
           type: string
+        runId:
+          type: string
         status:
           $ref: "#/components/schemas/CdDeploymentStatus"
         containerName:

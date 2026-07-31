@@ -2,6 +2,7 @@ package eu.wohlben.qits.cd.api;
 
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -50,9 +51,13 @@ public class CdDeploymentFlowTest {
   }
 
   private void postBuildSucceeded(String repoId, String branch, String sha) {
+    postBuildSucceeded("run-1", repoId, branch, sha);
+  }
+
+  private void postBuildSucceeded(String runId, String repoId, String branch, String sha) {
     given()
         .contentType(ContentType.JSON)
-        .body(Map.of("runId", "run-1", "repoId", repoId, "branch", branch, "commitSha", sha))
+        .body(Map.of("runId", runId, "repoId", repoId, "branch", branch, "commitSha", sha))
         .when()
         .post("/cd/api/events/build-succeeded")
         .then()
@@ -98,6 +103,9 @@ public class CdDeploymentFlowTest {
     assertEquals("ACTIVE", deployment.get("status"));
     assertEquals(SHA_A, deployment.get("commitSha"));
     assertEquals("app-green", deployment.get("applicationName"));
+    // The run that caused it, straight from the intake and out again on the read surface — this is
+    // the whole deployment -> /ci/runs/<runId> click-through.
+    assertEquals("run-1", deployment.get("runId"));
     String containerName = (String) deployment.get("containerName");
     assertTrue(
         containerName.startsWith("qits-cd-flow-green-app-green-"),
@@ -269,6 +277,58 @@ public class CdDeploymentFlowTest {
     // 202 either way (fire-and-forget sender), but nothing was queued or pulled.
     awaitDeployments(environmentId, 0);
     assertEquals(List.of(), driver.pulledRefs());
+  }
+
+  @Test
+  public void eachDeploymentCarriesTheRunOfTheBuildThatCausedIt() {
+    // Two green builds of the same application: each row names its own run, so the click-through
+    // from a historical deployment reaches the build that produced THAT image, not the newest one.
+    String environmentId = createEnvironment("flow-runid", "repo-runid", "app-runid");
+    postBuildSucceeded("6f31a0c4-1c2b-4f7a-9b03-2ee45c1f8d61", "repo-runid", "epic/flow-runid", SHA_A);
+    awaitDeployments(environmentId, 1);
+    postBuildSucceeded("b41d7e90-9a11-4c33-8f0d-77c0e13a4412", "repo-runid", "epic/flow-runid", SHA_B);
+
+    List<Map<String, Object>> deployments = awaitDeployments(environmentId, 2);
+    assertEquals("b41d7e90-9a11-4c33-8f0d-77c0e13a4412", deployments.get(0).get("runId"));
+    assertEquals(SHA_B, deployments.get(0).get("commitSha"));
+    assertEquals("6f31a0c4-1c2b-4f7a-9b03-2ee45c1f8d61", deployments.get(1).get("runId"));
+    assertEquals(SHA_A, deployments.get(1).get("commitSha"));
+  }
+
+  @Test
+  public void aDeploymentWithNoRunNamesNoneRatherThanInventingOne() {
+    // The sender may omit runId — every deployment recorded before the column existed reads this
+    // way too, and the read surface must say null rather than guess a run from the sha.
+    String environmentId = createEnvironment("flow-norunid", "repo-norunid", "app-norunid");
+    given()
+        .contentType(ContentType.JSON)
+        .body(Map.of("repoId", "repo-norunid", "branch", "epic/flow-norunid", "commitSha", SHA_A))
+        .when()
+        .post("/cd/api/events/build-succeeded")
+        .then()
+        .statusCode(202);
+
+    List<Map<String, Object>> deployments = awaitDeployments(environmentId, 1);
+    assertEquals("ACTIVE", deployments.get(0).get("status"));
+    assertNull(deployments.get(0).get("runId"));
+  }
+
+  @Test
+  public void anOversizedRunIdIsRejectedRatherThanFailingTheInsert() {
+    // The column is bounded, and the sender is fire-and-forget: without the boundary check this is
+    // a 500 on an insert and a deployment that silently never happens.
+    given()
+        .contentType(ContentType.JSON)
+        .body(
+            Map.of(
+                "runId", "r".repeat(300),
+                "repoId", "repo-bigrun",
+                "branch", "main",
+                "commitSha", SHA_A))
+        .when()
+        .post("/cd/api/events/build-succeeded")
+        .then()
+        .statusCode(400);
   }
 
   @Test

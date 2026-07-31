@@ -33,9 +33,11 @@ public class CdEventController {
   @Inject DeployService deployService;
 
   /**
-   * One green pipeline for one commit. {@code runId} is recorded nowhere yet but travels for
-   * traceability; the triple that matters is (repoId, branch, commitSha) — cd resolves the image
-   * from it by convention and owns everything after that.
+   * One green pipeline for one commit. The triple that matters is (repoId, branch, commitSha) — cd
+   * resolves the image from it by convention and owns everything after that. {@code runId} is
+   * optional and drives nothing: it is recorded on each deployment this queues so a reader can walk
+   * from a deployment row to {@code /ci/runs/<runId>}, the only edge between the two services'
+   * histories. A sender that omits it still deploys; the row simply names no build.
    */
   public record BuildSucceededEvent(
       String runId, @NotBlank String repoId, @NotBlank String branch, @NotBlank String commitSha) {}
@@ -49,7 +51,8 @@ public class CdEventController {
   @Path("/build-succeeded")
   @Operation(hidden = true)
   public Response buildSucceeded(@Valid BuildSucceededEvent event) {
-    deployService.onBuildSucceeded(event.repoId(), event.branch(), event.commitSha());
+    deployService.onBuildSucceeded(
+        event.runId(), event.repoId(), event.branch(), event.commitSha());
     return Response.accepted().build();
   }
 }

@@ -14,7 +14,9 @@ applications it tracks. The intended lifecycle, end to end:
 2. Pushes to `epic/<name>` reach the git host, qits-ci builds them, and on a green run notifies
    this service — `POST /cd/api/events/build-succeeded` with `{runId, repoId, branch, commitSha}`.
 3. cd matches (repoId, branch) against its environments. For each tracked application it records a
-   deployment and, on its worker: derives the image reference by convention
+   deployment — carrying `runId` verbatim, the row's one pointer back at the build that caused it
+   (`/ci/runs/<runId>`); cd resolves it against nothing and it is null on every row recorded before
+   the column existed — and, on its worker: derives the image reference by convention
    (`<registry>/qits/<application>:<sha>`), pulls it, starts it on the environment's network with a
    docker-native health gate, and — only once the fresh container reports healthy — decommissions
    the container it replaces.
@@ -202,9 +204,10 @@ local native-image; without one Quarkus silently falls back to a container build
 
 Everything from `verify` down runs `package`, and `package` is where Quinoa builds the client — so
 those three lines want `git submodule update --init` and a node on `PATH` (the platform pin is
-22.22.0; the Angular CLI at 21 wants `^20.19 || ^22.12 || >=24`). On the deployment host the default
-`@QuarkusTest` port 8081 is the published address of the platform's own npm registry, so a suite run
-there wants `-Dquarkus.http.test-port=18081` or another free port.
+22.22.0; the Angular CLI at 21 wants `^20.19 || ^22.12 || >=24`). No port argument is needed
+anywhere: the suite takes a free port (`quarkus.http.test-port=0`, in the service module's test
+resources), because Quarkus' default test port 8081 is the published address of the platform's own
+npm registry on the deployment host.
 
 ## Deploying it
 
