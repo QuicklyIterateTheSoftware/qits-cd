@@ -19,7 +19,15 @@
 
          A DEPLOYABLE APP, not a library JAR — <packaging>quarkus</packaging> binds augmentation
          into the lifecycle so it cannot be silently misplaced (the migration-deployables-plan.md
-         reasoning, verbatim from the siblings). -->
+         reasoning, verbatim from the siblings). It serves its own client: src/main/webui is the
+         qits-spa-cd submodule, which Quinoa builds into this artifact during augmentation, so one
+         process answers /cd/ and /cd/api and the gateway needs no second upstream.
+
+         NEVER let quarkus-undertow onto this classpath. Its presence breaks Quinoa's production
+         static serving — the client 404s from a build that was green — and it arrives transitively
+         from anything servlet-shaped. `./mvnw -pl service -am dependency:tree | grep -i undertow`
+         before adding a dependency that sounds like a web framework
+         (docs/project-setup-quinoa-angular.md in the qits superproject). -->
     <artifactId>qits-cd-service</artifactId>
     <name>qits-cd :: service</name>
     <packaging>quarkus</packaging>
@@ -61,6 +69,15 @@
             <!-- @Valid on the intake and environment payloads. -->
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-hibernate-validator</artifactId>
+        </dependency>
+        <dependency>
+            <!-- The Angular SPA in src/main/webui (a submodule on qits-spa-cd's main): Quinoa runs
+                 its npm build during augmentation and registers the output as static resources.
+                 Quinoa is in NO BOM, so the version is pinned — in the ROOT pom's
+                 dependencyManagement, with the reasoning for 2.8.2 beside the property. Its build
+                 needs an npm and a node on PATH; see the note in application.properties. -->
+            <groupId>io.quarkiverse.quinoa</groupId>
+            <artifactId>quarkus-quinoa</artifactId>
         </dependency>
         <dependency>
             <!-- @Operation(hidden = true): the build-succeeded intake is a wire/system API and

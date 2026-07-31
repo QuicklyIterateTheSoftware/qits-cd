@@ -6,10 +6,25 @@ the conventions. This file is the working conventions on top of it.
 ## The two rules that shape everything
 
 **A clone of this repo alone builds and tests green** — no monorepo, no docker, no prior
-`mvn install` elsewhere, no credentials. `mvn verify` is the gate. That is why the poms duplicate
-versions instead of inheriting them, and why the one seam that needs real docker is faked
-(`FakeDeploymentDriver`, a scripted fake behind the `DeploymentDriver` interface) rather than
-skipped.
+`mvn install` elsewhere, no credentials. That is why the poms duplicate versions instead of
+inheriting them, and why the one seam that needs real docker is faked (`FakeDeploymentDriver`, a
+scripted fake behind the `DeploymentDriver` interface) rather than skipped.
+
+**Which command is the gate depends on whether you have the client**, and this is worth getting
+right because the clone rule now has two halves (`git clone … && git submodule update --init`):
+
+- `./mvnw test` — needs **neither node nor the webui submodule**. Quinoa is disabled by default in
+  test mode (it says so: `Quinoa is disabled by default in tests.`), so every `@QuarkusTest` here
+  passes against an empty `webui/` on a machine with no node at all.
+- `./mvnw verify` — runs `package` on its way to failsafe, and `package` is where Quinoa augments.
+  So verify needs **both**, and against an uninitialised submodule it fails with
+  `No package.json found in Web UI directory: 'src/main/webui'`. That is true of every SPA-serving
+  service, not a wart of this one; `docs/project-setup-quinoa-angular.md` in the superproject
+  states it correctly.
+
+On the deployment host the default `@QuarkusTest` port 8081 is the platform's own npm registry, so
+a suite run there wants `-Dquarkus.http.test-port=18081` or another free port. (Failsafe already
+launches the packaged artifact on port 0; see `service/pom.xml`.)
 
 **`service/` compiles to a GraalVM native image** — the same rule every deployable sibling
 carries. `.sdkmanrc` names `25.0.2-graalce`, so `sdk env` gives you a `native-image` and
@@ -34,6 +49,10 @@ package:
 - `service/` — `api` (the JAX-RS routes and `CdExceptionMapper`), `security` (the forward-auth
   pair), and `dockerhost` (`DockerDeploymentDriver` — the sole implementation of the seam, kept
   here because it is cd's whole relationship with the host's docker daemon).
+
+One package sits outside that tree: `eu.wohlben.qits.webui`, holding `WebUiRedirect` and only that.
+It keeps the sibling services' spelling rather than taking a `cd`-flavoured one, so the file is
+recognisable across repos.
 
 The directories are `cd/` and `service/`; the artifactIds are `qits-cd-domain` and
 `qits-cd-service` — generic coordinates would collide in a shared `~/.m2`.
@@ -119,6 +138,33 @@ The intake path is a **cross-repo contract**: qits-ci's `CdBuildNotifier` POSTs
 `/cd/api/events/build-succeeded` fire-and-forget via its `qits.cd.intake-url`. A mismatch raises
 no error anywhere. Move one, move both.
 
+**A new machine surface outside `/cd/api` needs a line in `quarkus.quinoa.ignored-path-prefixes`,
+in the same commit.** Quinoa's SPA fallback is a catch-all at `/cd/*` registered near-last, so a
+real route still wins — but a path matching *no* route is rerouted to `index.html` and answers
+`200 text/html`, which a machine client parses as data. The caller that makes this concrete here is
+the intake: it is fire-and-forget, so it would never report having been handed a web page. Three
+facts about that key, all measured on sibling services:
+
+- Setting it **replaces** Quinoa's derivation rather than extending it. The derivation reads
+  `quarkus.rest.path` and `quarkus.http.non-application-root-path` and produces exactly `/api,/q` —
+  which is why those two are repeated by hand in the key today. Naming a third alone would
+  *un-ignore* both.
+- The values are matched **after** `ui-root-path` is stripped, so they are **relative**. `/cd/api`
+  written there matches nothing at all and is indistinguishable from leaving the key unset — the
+  failure that hides.
+- `@WebSocket` and anything registered straight onto the Vert.x router do **not** follow
+  `quarkus.rest.path`; they take a literal path and need their own entry. websockets-next claims
+  only the upgrade handshake, so a plain GET on a socket path falls through to the SPA (measured on
+  qits-ci's `/ci/daemon`: `200 index.html` from a green build). cd has no socket and no other
+  literal today — the one thing it puts on the router is `WebUiRedirect` at the bare `/cd`, which is
+  outside `/cd/*` and so is not Quinoa's to swallow.
+
+The segment itself is spelled in **four** places that move together: `quarkus.quinoa.ui-root-path`,
+`quarkus.rest.path`, `quarkus.http.non-application-root-path`, and the client's `baseHref` in
+qits-spa-cd's `angular.json` — the fourth in another repository, where no build here can check it.
+A `baseHref` that disagrees yields a page that loads and then fetches its own JavaScript from the
+wrong place, and no server-side test can see it.
+
 ## Adding a dependency on another context
 
 Don't. This context has no compile-time dependency on any other qits module and should not grow
@@ -131,6 +177,19 @@ deployment → application) are fine and are not what the rule is about.
 
 `cd/src/main/resources/db/cd/migration/`, hand-written, its own lineage on its own datasource —
 keep appending, never edit an applied migration.
+
+## Dependencies
+
+**`quarkus-undertow` must never be on the classpath.** Its presence breaks Quinoa's production
+static serving — the client 404s from a build that was green — and it arrives *transitively* from
+anything servlet-shaped. Check before adding anything that sounds like a web framework:
+
+    ./mvnw -pl service -am dependency:tree | grep -i undertow
+
+**Quinoa is in no BOM**, so its version is pinned by hand, in the root pom's properties
+(`quinoa.version`) rather than beside the dependency. 2.8.2 is the last release built against a
+Quarkus *older* than the platform's 3.34.6; 2.8.3 is built against 3.36.2, ahead of us. Bump only
+when the platform's Quarkus passes the version a release is built against.
 
 ## Tests
 
@@ -154,3 +213,53 @@ keep appending, never edit an applied migration.
   restating the URL), Flyway's migration surviving as a resource. It points
   `qits.cd.container-runtime` at a binary that does not exist, which both keeps it free of host
   side effects and proves every driver call degrades to a warning rather than a failure.
+- **`CdPackagedSurfaceIT` is also the only test that ever sees the client.** Quinoa is disabled in
+  test mode, so no `@QuarkusTest` here has a client in it at all — a unit test asserting anything
+  about `/cd/` would pass against a process serving nothing. The probe list is the platform's, from
+  `docs/project-setup-quinoa-angular.md` in the superproject, and any change touching the Quinoa
+  setup re-runs it: `/cd/` → 200 HTML with the right `<base href>`; a deep link → 200 `index.html`;
+  `/cd/api/<real>` → the API's own answer; `/cd/api/nope` → 404 and **not the client**; every
+  literal machine path, mistyped → 404. Note the last ones are asserted as "404 and not
+  `index.html`" rather than "404 and not HTML": what a mistyped path actually gets is Vert.x' own
+  stock `<h1>Resource not found</h1>`, which is `text/html` and correct. The content type alone
+  cannot tell the two apart, so the *absence of the client* is what is pinned.
+- `WebUiRedirectTest` is a plain `@QuarkusTest` and can be, precisely because the bare-segment
+  redirect is this service's own Vert.x route rather than Quinoa's — it must answer whether or not
+  a client is packaged. Its `theSlashFormIsNotThisRoutesBusiness` leans on Quinoa being off under
+  `%test`: `/cd/` falling through to a 404 is the proof that this route let it pass instead of
+  looping the redirect onto itself.
+
+## The image and the pipeline
+
+`docker/Dockerfile` and `.config/qits/ci-post-receive.yml` are two halves of one thing, and the seam
+between them is the only reason either is interesting: **the client cannot be built inside a docker
+build.** It depends on `@qits/ui-components`, which lives only on the platform's own npm registry,
+and a `RUN` step reaches the public internet but reaches that registry by no address at all. So the
+pipeline step — which runs on `qits-net`, where it does resolve — installs and builds the bundle,
+and the Dockerfile's builder stage neuters Quinoa's install/ci/build commands to `--version` and
+packages what it was handed.
+
+Three things follow, and each is load-bearing:
+
+- **`.dockerignore` does NOT exclude the client's `dist/`.** That departs from the platform's Quinoa
+  reference, which does — here `dist/` is the payload, and excluding it fails the build at the
+  `test -f` guard. Every SPA-serving service in the platform carries the same departure.
+- **The two `package-manager-install` flags exist only on the Dockerfile's `mvnw` line**, because the
+  Mandrel builder image ships no node. They must never go into `application.properties`: a local or
+  CI build must use the node on `PATH`, so that no build silently downloads a toolchain. `22.22.0` is
+  the platform pin.
+- **The bundle is `cp`'d onto itself before the build.** Quinoa *moves* `build-dir` rather than
+  copying it, and overlayfs cannot rename a directory that still lives in a lower image layer — it
+  answers EXDEV and the JDK's fallback refuses a non-empty directory, dying with
+  `DirectoryNotEmptyException` seconds in. The `cp` re-materialises it in the layer that is about to
+  move it, which is why it has to be in that same `RUN`.
+
+The pipeline also rewrites `package-lock.json`'s `resolved` **origins** before `npm ci`: npm fetches
+tarballs by the absolute URL in the lockfile and ignores the configured registry, and npm's own
+`--replace-registry-host` is broken for a registry mounted under a path prefix. The committed
+lockfile keeps the developer-host origin, which is correct locally.
+
+That the *deployer* is also a deployed application is the one thing this repo's pipeline adds over
+its siblings': a green run here announces `qits-cd` to `qits-cd`, which takes the self-update
+handoff. The `/cd` surface blips mid-cutover; a successor that misses its health gate leaves the
+predecessor serving.

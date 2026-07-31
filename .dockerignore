@@ -13,6 +13,21 @@
 **/target
 **/target-ide
 
+# The webui submodule's install output: a symlink farm full of platform-native binaries compiled for
+# the host rather than for ubi9, and nothing in the build stage reads it — the stage runs no install
+# and no client build (see docker/Dockerfile). `.angular` is the CLI's own cache, the same shape of
+# host-local junk.
+#
+# NOTE THE ASYMMETRY with the platform's Quinoa recipe
+# (docs/project-setup-quinoa-angular.md in the qits superproject), which excludes the client's dist/
+# as well: here dist/ is the PAYLOAD. qits-spa-cd depends on @qits/ui-components, which exists only
+# on the platform's own npm registry, reachable from no address a docker build has — so the bundle
+# is built BEFORE this image by .config/qits/ci-post-receive.yml, on qits-net where that registry
+# answers. Excluding dist/ would fail the build at the `test -f` guard on the mvnw line. Every
+# SPA-serving service in the platform carries this same departure, for the same reason.
+**/node_modules
+service/src/main/webui/.angular
+
 # Local env / IDE cruft
 .env
 .idea

@@ -39,6 +39,15 @@
         <quarkus.platform.group-id>io.quarkus.platform</quarkus.platform.group-id>
         <quarkus.platform.version>3.34.6</quarkus.platform.version>
 
+        <!-- Quinoa is in NO BOM, so the version is pinned here rather than inherited, and it is
+             pinned in the PARENT rather than beside the dependency so there is one place to read it
+             from when the platform's Quarkus moves. 2.8.2 is the last release built against a
+             Quarkus OLDER than the platform's 3.34.6 (3.27.3 LTS — the compatible direction); 2.8.3
+             is built against 3.36.2, ahead of us. Bump only when the platform's Quarkus passes the
+             version a Quinoa release is built against
+             (docs/project-setup-quinoa-angular.md in the qits superproject). -->
+        <quinoa.version>2.8.2</quinoa.version>
+
         <compiler-plugin.version>3.15.0</compiler-plugin.version>
         <surefire-plugin.version>3.5.4</surefire-plugin.version>
         <failsafe-plugin.version>3.5.4</failsafe-plugin.version>
@@ -50,7 +59,11 @@
         <!-- `mvn verify` must be green on a clone with no docker — the suites fake the one seam
              that needs it (FakeDeploymentDriver). The packaged-artifact IT runs with
              -DskipITs=false, and `service`'s `native` profile flips it so a -Dnative build
-             exercises the binary it just compiled instead of packaging it and asserting nothing. -->
+             exercises the binary it just compiled instead of packaging it and asserting nothing.
+             It is skipped by default for a second reason since this service grew a client: it runs
+             against the BUILT artifact, so it needs a `package` to have happened, and a package
+             here needs a checked-out webui submodule and a node on PATH — neither of which the
+             clone-alone rule promises. Ask for it explicitly. -->
         <skipITs>true</skipITs>
 
         <!-- Surefire's @{argLine} has no value unless something (jacoco/quarkus) sets it. -->
@@ -76,6 +89,13 @@
                 <groupId>org.mapstruct</groupId>
                 <artifactId>mapstruct</artifactId>
                 <version>${mapstruct.version}</version>
+            </dependency>
+            <dependency>
+                <!-- The Angular client in service/src/main/webui. See the pin's reasoning at
+                     quinoa.version above; the dependency itself is declared in service/pom.xml. -->
+                <groupId>io.quarkiverse.quinoa</groupId>
+                <artifactId>quarkus-quinoa</artifactId>
+                <version>${quinoa.version}</version>
             </dependency>
             <!-- The reactor's own module, so `service` depends on it version-less. -->
             <dependency>

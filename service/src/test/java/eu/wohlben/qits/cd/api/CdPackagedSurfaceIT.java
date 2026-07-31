@@ -1,6 +1,7 @@
 package eu.wohlben.qits.cd.api;
 
 import static io.restassured.RestAssured.given;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.quarkus.test.junit.QuarkusIntegrationTest;
@@ -29,6 +30,23 @@ import org.junit.jupiter.api.Test;
  *   <li>an environment round-trips through Hibernate/Panache in the packaged process.
  * </ul>
  *
+ * <p>It is also <b>the only test here that ever sees the client</b>. Quinoa is disabled by default
+ * in test mode, so no {@code @QuarkusTest} in this repo has a client in it at all — a unit test
+ * asserting something about {@code /cd/} would pass against a process serving nothing. What the SPA
+ * is actually served as is proven here or nowhere, and the probe list is the platform's, from
+ * {@code docs/project-setup-quinoa-angular.md}:
+ *
+ * <ul>
+ *   <li>{@code /cd/} → 200 HTML carrying the right {@code <base href>} — the client's own spelling
+ *       of the segment, set in another repository's {@code angular.json}, where no build here can
+ *       check it. Wrong, and the page loads and then fetches its JavaScript from nowhere.
+ *   <li>a deep link → 200 {@code index.html}, so the Angular router owns it across a reload
+ *   <li>{@code /cd/api/<real>} → the API's own answer; {@code /cd/api/nope} → 404 and <b>not the
+ *       client</b>. That is what {@code quarkus.quinoa.ignored-path-prefixes} buys, and the caller
+ *       it protects is qits-ci's fire-and-forget intake — the one that would never report being
+ *       handed a web page instead of an answer.
+ * </ul>
+ *
  * <p>No deployment is driven here: that needs docker, and the packaged process carries the real
  * {@link eu.wohlben.qits.cd.dockerhost.DockerDeploymentDriver}. The container runtime is pointed
  * at a binary that does not exist, which exercises the best-effort seam (an environment must exist
@@ -55,6 +73,94 @@ public class CdPackagedSurfaceIT {
           // No docker on purpose: every driver call must degrade to a warning, never a failure.
           "qits.cd.container-runtime", "docker-absent-for-this-it");
     }
+  }
+
+  @Test
+  public void theClientIsServedAtTheSegmentWithItsOwnBaseHref() {
+    String html =
+        given()
+            .when()
+            .get("/cd/")
+            .then()
+            .statusCode(200)
+            .contentType(ContentType.HTML)
+            .extract()
+            .asString();
+    assertTrue(
+        html.contains("<base href=\"/cd/\">"),
+        "the client's baseHref must be the segment it is mounted at; got: "
+            + html.substring(0, Math.min(400, html.length())));
+  }
+
+  @Test
+  public void aDeepLinkFallsBackToTheClientSoItsRouterOwnsIt() {
+    String deepLink =
+        given()
+            .when()
+            .get("/cd/some/route")
+            .then()
+            .statusCode(200)
+            .contentType(ContentType.HTML)
+            .extract()
+            .asString();
+    assertTrue(
+        deepLink.contains("<base href=\"/cd/\">"),
+        "a deep link must answer with index.html, not with a differently-shaped page");
+  }
+
+  @Test
+  public void theBareSegmentRedirectsRatherThanFourOhFouring() {
+    // Quinoa mounts at /cd/*, which does not match the bare segment (upstream #960) — the redirect
+    // in webui/WebUiRedirect is this service's answer, and only the packaged process has both it
+    // and a real client to bounce to.
+    given()
+        .redirects()
+        .follow(false)
+        .when()
+        .get("/cd")
+        .then()
+        .statusCode(301)
+        .header("Location", "/cd/");
+  }
+
+  @Test
+  public void aMistypedMachinePathIsNeverTheClient() {
+    // The whole reason quarkus.quinoa.ignored-path-prefixes is set: without /api in that list this
+    // answers 200 with index.html, and qits-ci's intake — which swallows delivery failures at debug
+    // — would parse the client's not-found page as an accepted delivery.
+    //
+    // The assertion is "404, and not the CLIENT" rather than the reference's shorter "404, never
+    // HTML", because what actually comes back here is Vert.x' own stock 53-byte
+    // `<h1>Resource not found</h1>` — text/html, and correct. Every sibling service answers a
+    // mistyped machine path the same way; asserting on the content type alone would fail against
+    // the right behaviour while still passing against the wrong one (index.html is text/html too).
+    String body = given().when().get("/cd/api/nope").then().statusCode(404).extract().asString();
+    assertFalse(
+        body.contains("<base href=\"/cd/\">"),
+        "a mistyped machine path must not be answered with the client; got: " + body);
+
+    // /q is the second half of the ignore list, and the derivation would have covered both — this
+    // pins that setting the key by hand did not drop one.
+    String underQ =
+        given().when().get("/cd/q/health/nope").then().statusCode(404).extract().asString();
+    assertFalse(
+        underQ.contains("<base href=\"/cd/\">"),
+        "a mistyped non-application path must not be answered with the client; got: " + underQ);
+
+    // qits-gateway routes verbatim by prefix, so there is no unprefixed form to fall back to.
+    given().when().get("/api/environments").then().statusCode(404);
+  }
+
+  @Test
+  public void theReadinessEndpointIsWhereTheDeploymentLooksForIt() {
+    // The path this service's own health gate would curl for a peer, at the address the deployment
+    // convention assumes — under quarkus.http.non-application-root-path, not the rest path.
+    given()
+        .when()
+        .get("/cd/q/health/ready")
+        .then()
+        .statusCode(200)
+        .body("status", org.hamcrest.Matchers.equalTo("UP"));
   }
 
   @Test

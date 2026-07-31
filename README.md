@@ -95,16 +95,35 @@ neither instance referees its own succession.
 
 ## HTTP surface
 
-Everything lives under `/cd/api` (`quarkus.rest.path`); qits-gateway routes `/cd/*` verbatim, and
-service-to-service calls on qits-net address the same paths.
+Everything lives under this service's gateway segment, `/cd`; qits-gateway routes `/cd/*` verbatim,
+and service-to-service calls on qits-net address the same paths. The machine surface is `/cd/api`
+(`quarkus.rest.path`) and `/cd/q` (`quarkus.http.non-application-root-path`); the rest of the
+segment is the client's.
 
 | Path | Verbs | What |
 |---|---|---|
+| `/cd/` | GET | the Angular SPA, built from `service/src/main/webui` by Quinoa and served by this process (`quarkus.quinoa.ui-root-path`); unmatched paths under it fall back to `index.html`, so the client's own router gets its deep links — except under the prefixes below |
+| `/cd` | GET, HEAD | a 301 to `/cd/`. Quinoa mounts at `/cd/*`, which does not match the bare segment (upstream quinoa #960); `webui/WebUiRedirect` is this service's answer |
 | `/cd/api/environments` | GET, POST | list; create (machine call from the epic orchestration) |
 | `/cd/api/environments/{id}` | GET, DELETE | one environment with its applications; teardown |
 | `/cd/api/deployments?environmentId=` | GET | an environment's deployments, newest-first |
 | `/cd/api/events/build-succeeded` | POST | the qits-ci intake (hidden from the OpenAPI document) |
 | `/cd/q/openapi`, `/cd/q/swagger-ui` | GET | the API document |
+| `/cd/q/health/ready` | GET | the readiness endpoint this service's own health gate curls on a peer |
+
+The SPA takes the *whole* segment, so it is the one that can swallow the rest: the deep-link
+fallback answers anything under `/cd` that matched no route, with `200 text/html`. That is right for
+a person and wrong for a machine — and the machine this protects is qits-ci's intake, which is
+fire-and-forget and would never report having been handed a web page. Quinoa **derives** the
+exclusion list from `quarkus.rest.path` and `quarkus.http.non-application-root-path` when the key is
+unset, and that derivation *is* exactly right today: every route here is JAX-RS under `/cd/api`, and
+the only thing this service puts on the Vert.x router is the bare-segment redirect at `/cd`, which
+is outside `/cd/*`. `quarkus.quinoa.ignored-path-prefixes=/api,/q` is spelled out anyway, ahead of
+the need — the convention is that a new literal route and its prefix entry land in the same commit,
+and a list already present makes that a one-line change. Two traps travel with it: setting the key
+**replaces** the derivation rather than extending it (so `/api` and `/q` are repeated by hand), and
+the values are matched **after** `ui-root-path` is stripped, so they are relative — `/cd/api`
+written there matches nothing at all and is indistinguishable from not setting the key.
 
 There is **no machine token** in this service, and that is a decision, not an omission. Nothing of
 cd is on the gateway's token-free allowlist, so every `/cd/*` path — the intake included — is
@@ -120,6 +139,37 @@ authenticates nothing and authorizes nothing.
 The intake is a **fire-and-forget contract**: qits-ci's notifier swallows delivery failures at
 debug, so a path mismatch between the two repos raises no error anywhere and deployments simply
 stop. Both ends pin the literal path and both suites assert the absolute address.
+
+## The client
+
+[qits-spa-cd](https://github.com/QuicklyIterateTheSoftware/qits-spa-cd) — Angular 21, standalone
+components, no SSR — is a submodule at `service/src/main/webui`, which is Quinoa's default
+`web-ui-dir`, so the path is a convention rather than a setting. Its `angular.json` sets `baseHref`
+to `"/cd/"`: the segment is spelled in **four** places that move together
+(`quarkus.quinoa.ui-root-path`, `quarkus.rest.path`, `quarkus.http.non-application-root-path`, and
+that one), and the fourth is in another repository where no build here can check it. A `baseHref`
+that disagrees yields a page that loads and then fetches its own JavaScript from the wrong place,
+and no server-side test can see it.
+
+That gives this repo a clone rule with two halves:
+
+    git clone … && git submodule update --init
+
+- **The test suite needs neither node nor the submodule.** Quinoa is disabled by default in test
+  mode (`Quinoa is disabled by default in tests.`), so every `@QuarkusTest` here is green against an
+  empty `webui/` on a machine with no node at all — `./mvnw test`.
+- **Anything that reaches `package` needs both**, and that includes `./mvnw verify`, which runs
+  `package` on its way to failsafe. An uninitialised gitlink is an *empty directory*, and that is
+  the one case Quinoa treats as a misconfiguration rather than "no client": augmentation stops at
+  `No package.json found in Web UI directory`. This holds for every SPA-serving service, not just
+  this one; `./mvnw test` is the command the clone-alone rule actually names.
+
+The client depends on `@qits/ui-components`, which exists only on the platform's own npm registry —
+reachable from a developer's host (its committed `.npmrc` names `localhost:8081`) and from
+`qits-net`, and from **no address inside a docker build**. So the image build does not build the
+client: `.config/qits/ci-post-receive.yml` builds it in a step container on `qits-net` and
+`docker/Dockerfile` packages the bundle it was handed. Every SPA-serving service in the platform
+does this, for the same reason.
 
 ## What is deliberately not here
 
@@ -141,13 +191,20 @@ stop. Both ends pin the literal path and both suites assert the absolute address
 
 ## Building and testing
 
-    ./mvnw verify                 # the gate: green on a clone, no docker, no credentials
+    ./mvnw test                   # the clone-alone gate: no docker, no node, no submodule
+    ./mvnw verify                 # + a package, so it needs the webui submodule and a node on PATH
     ./mvnw verify -DskipITs=false # + CdPackagedSurfaceIT against the packaged fast-jar
     ./mvnw verify -Dnative        # native binary (service/target/qits-cd) + the IT against it
 
 The one seam that needs docker is faked in the suites (`FakeDeploymentDriver`); the docker CLI is
 only ever exercised in a real deployment. `sdk env` (`.sdkmanrc`, GraalVM 25) gives `-Dnative` a
 local native-image; without one Quarkus silently falls back to a container build — grep the log.
+
+Everything from `verify` down runs `package`, and `package` is where Quinoa builds the client — so
+those three lines want `git submodule update --init` and a node on `PATH` (the platform pin is
+22.22.0; the Angular CLI at 21 wants `^20.19 || ^22.12 || >=24`). On the deployment host the default
+`@QuarkusTest` port 8081 is the published address of the platform's own npm registry, so a suite run
+there wants `-Dquarkus.http.test-port=18081` or another free port.
 
 ## Deploying it
 
