@@ -150,6 +150,10 @@ the guard existed, which is what lets the code deploy before qits-idp does. A de
 `QITS_AUTH_MACHINE_REQUIRED=true` only once qits-ci is actually sending a bearer — the notifier
 swallows delivery failures at debug, so a premature flip stops deployments silently.
 
+Validation follows that same gate: `quarkus.oidc.tenant-enabled=${qits.auth.machine.required:false}`.
+Gate off, there is no OIDC tenant — nothing fetches a JWKS and a clone-alone build needs no issuer.
+There is no third state. qits-ci and qits-artifacts carry the same line.
+
 The intake path is a **cross-repo contract**: qits-ci's `CdBuildNotifier` POSTs
 `/cd/api/events/build-succeeded` fire-and-forget via its `qits.cd.intake-url`. A mismatch raises
 no error anywhere. Move one, move both.
