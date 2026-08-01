@@ -196,6 +196,13 @@ keep appending, never edit an applied migration.
 
 ## Dependencies
 
+**Two submodules, and a build needs both.** `service/src/main/webui` is qits-spa-cd (the client)
+and `qits-integrations-quarkus` is the platform's shared Quarkus glue, listed first in the reactor
+and built in place — the shape qits-ci uses for `eventstream`. An uninitialised one fails as
+maven's `Child module … does not exist` or Quinoa's `No package.json found in Web UI directory`,
+neither of which names the cause. `git submodule update --init` is half of a clone here, and
+`.config/qits/ci-post-receive.yml` runs it for the same reason.
+
 **`quarkus-undertow` must never be on the classpath.** Its presence breaks Quinoa's production
 static serving — the client 404s from a build that was green — and it arrives *transitively* from
 anything servlet-shaped. Check before adding anything that sounds like a web framework:

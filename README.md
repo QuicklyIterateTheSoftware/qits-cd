@@ -163,9 +163,11 @@ That gives this repo a clone rule with two halves:
 
     git clone … && git submodule update --init
 
-- **The test suite needs neither node nor the submodule.** Quinoa is disabled by default in test
-  mode (`Quinoa is disabled by default in tests.`), so every `@QuarkusTest` here is green against an
-  empty `webui/` on a machine with no node at all — `./mvnw test`.
+- **The test suite needs neither node nor the client submodule.** Quinoa is disabled by default in
+  test mode (`Quinoa is disabled by default in tests.`), so every `@QuarkusTest` here is green
+  against an empty `webui/` on a machine with no node at all — `./mvnw test`. The *other* submodule,
+  `qits-integrations-quarkus`, is a reactor module and is needed by every command: without it maven
+  stops at `Child module … does not exist` before a line compiles.
 - **Anything that reaches `package` needs both**, and that includes `./mvnw verify`, which runs
   `package` on its way to failsafe. An uninitialised gitlink is an *empty directory*, and that is
   the one case Quinoa treats as a misconfiguration rather than "no client": augmentation stops at
