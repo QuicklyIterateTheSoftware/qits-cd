@@ -116,6 +116,15 @@
             <artifactId>rest-assured</artifactId>
             <scope>test</scope>
         </dependency>
+        <dependency>
+            <!-- Test-only token issuer. The gate-on suite signs its own RS256 tokens with the key
+                 pair in src/test/resources and has quarkus-oidc verify them locally, so the
+                 enforcement path is exercised end to end — signature, issuer, audience, guard —
+                 with no qits-idp to reach. Nothing in src/main mints a token. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-smallrye-jwt-build</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

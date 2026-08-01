@@ -211,7 +211,17 @@ when the platform's Quarkus passes the version a release is built against.
 
 - App-level config lives in `service/src/main/resources/application.properties` and Quarkus merges
   it into the test config. **Never re-declare an app-level setting in test resources** — the test
-  copy carries only the in-memory H2.
+  copy carries only what a test run genuinely needs to be different: the port, the in-memory H2,
+  and `quarkus.devservices.enabled=false`.
+- **No dev services, ever.** A dev service is a container start, and the first rule here is that a
+  clone tests green with no docker. `quarkus-oidc` in particular launches a real Keycloak the
+  moment a profile leaves `quarkus.oidc.auth-server-url` unset — measured, not feared. One line in
+  the test resources shuts all of them off; keep it.
+- **Machine-token tests mint their own tokens.** `MachineTokens` signs RS256 with the key pair in
+  `service/src/test/resources/machine-token-*.pem`, and `MachineGuardEnforcedProfile` hands
+  quarkus-oidc the public half, so the enforced path is exercised end to end with no qits-idp to
+  reach. Those PEMs are **test fixtures, not credentials** — nothing outside the suite has ever
+  seen them, and no deployment key belongs in this repo.
 - `FakeDeploymentDriver` is `@Mock` and application-scoped, so it is shared across tests: reset it
   in `@BeforeEach`, use distinct environment names per test, and read its state through its
   **methods** — the injected reference is a CDI client proxy, and a field read on a proxy sees the
@@ -222,7 +232,8 @@ when the platform's Quarkus passes the version a release is built against.
   changes: `./mvnw -pl service -am test -Dtest=OpenApiSchemaExportTest
   -Dsurefire.failIfNoSpecifiedTests=false`. The intake is `@Operation(hidden = true)` (a wire
   API); the environment and deployment surfaces are the document. The test classpath is indexed
-  too, which is why `IdentityEchoResource` is hidden.
+  too, so a new `@Path` resource under `src/test` lands in the committed document unless it is
+  hidden.
 - `CdPackagedSurfaceIT` runs the **packaged artifact** (fast-jar under `-DskipITs=false`, binary
   under `-Dnative`) and asserts what a native build can silently lose: the build-time route
   prefixes, the shipped ${user.home}-rooted H2 default (it relocates `user.home` rather than
