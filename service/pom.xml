@@ -73,6 +73,15 @@
             <artifactId>qits-auth-core</artifactId>
         </dependency>
         <dependency>
+            <!-- Bearer validation against qits-idp. qits-auth-core deliberately does NOT bring it:
+                 validating a token is each service's own choice of extension and config, and the
+                 jar only reads the identity that validation leaves behind. Configured in
+                 application.properties; with the rollout gate off nothing here demands a token,
+                 and a request with no Authorization header still falls through to forward-auth. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-oidc</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-rest-jackson</artifactId>
         </dependency>
