@@ -49,9 +49,11 @@ package:
   (`EnvironmentService`, `DeployService`), the validation (`CdIdentifiers`), the shell-out
   (`CdProcess`), the image-reference convention (`ImageRefs`) and the docker seam
   (`DeploymentDriver`).
-- `service/` — `api` (the JAX-RS routes and `CdExceptionMapper`), `security` (the forward-auth
-  pair), and `dockerhost` (`DockerDeploymentDriver` — the sole implementation of the seam, kept
-  here because it is cd's whole relationship with the host's docker daemon).
+- `service/` — `api` (the JAX-RS routes and `CdExceptionMapper`) and `dockerhost`
+  (`DockerDeploymentDriver` — the sole implementation of the seam, kept here because it is cd's
+  whole relationship with the host's docker daemon). There is no `security` package any more: the
+  forward-auth pair moved to `qits-auth-core`, in the `qits-integrations-quarkus` submodule this
+  reactor builds.
 
 One package sits outside that tree: `eu.wohlben.qits.webui`, holding `WebUiRedirect` and only that.
 It keeps the sibling services' spelling rather than taking a `cd`-flavoured one, so the file is

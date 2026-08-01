@@ -25,7 +25,17 @@
     <name>qits-cd</name>
 
     <modules>
-        <!-- Listed first: `service` depends on it. -->
+        <!-- Listed in dependency order: `service` depends on both.
+
+             `qits-integrations-quarkus` is a SUBMODULE — another repository, checked out here so
+             the reactor builds it in place, the same shape qits-ci uses for `eventstream`. Its pom
+             is parentless and carries its own groupId and version; the reactor resolves it as a
+             module all the same. It is an AGGREGATOR rather than one jar, so whatever modules it
+             grows arrive without another edit here. A clone that has not initialised its
+             submodules has no such directory and the build fails at once with `Child module ...
+             does not exist`, which is the intended signal — see AGENTS.md for the command that
+             fixes it. -->
+        <module>qits-integrations-quarkus</module>
         <module>cd</module>
         <module>service</module>
     </modules>
@@ -97,10 +107,19 @@
                 <artifactId>quarkus-quinoa</artifactId>
                 <version>${quinoa.version}</version>
             </dependency>
-            <!-- The reactor's own module, so `service` depends on it version-less. -->
+            <!-- The reactor's own modules, so `service` depends on them version-less. -->
             <dependency>
                 <groupId>${project.groupId}</groupId>
                 <artifactId>qits-cd-domain</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <!-- From the qits-integrations-quarkus submodule above: the forward-auth pair this
+                     service used to carry itself, plus MachineAuth's claim checks and the
+                     machine-token rollout gate. Same groupId and version as this reactor, so
+                     ${project.*} resolves it. -->
+                <groupId>${project.groupId}</groupId>
+                <artifactId>qits-auth-core</artifactId>
                 <version>${project.version}</version>
             </dependency>
         </dependencies>
