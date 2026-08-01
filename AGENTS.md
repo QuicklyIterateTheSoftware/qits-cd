@@ -132,12 +132,23 @@ regression.
 suite inherits it — a resource's `@Path` is relative to it and must never repeat `cd`; tests
 address the absolute path, which is what makes them catch a prefix regression.
 
-There is **no machine token in this service** — nothing of cd is on the gateway's token-free
-allowlist, so every `/cd/*` path is session-guarded at the front door, and qits-net callers are
-trusted (that is where the intake's sender actually dials). The `qits.ci.token` pattern belongs to
-paths that are allowlisted at the gateway; do not reintroduce it here without the allowlist entry
-that would give it a job, and never the allowlist entry without the guard — qits-gateway's
-`PublicPathsTest.nothingOfCdIsPublic` is what makes that a conscious pair of changes.
+There is **no static machine token in this service** and none is ever to be added. Machine callers
+present a qits-idp bearer, validated by `quarkus-oidc` against `aud=qits-cd` and checked by
+`qits-auth-core`'s `MachineAuth`. Nothing of cd is on the gateway's token-free allowlist either, so
+every `/cd/*` path is also session-guarded at the front door — qits-gateway's
+`PublicPathsTest.nothingOfCdIsPublic` pins that.
+
+**Where `machineAuth.require()` goes, and where it does not.** On a path nothing human reaches, so
+a bearer is the only credential its caller could hold — today that is exactly the build-succeeded
+intake. Not on the environment surface: a person drives it through the gateway's session, and a
+guard there locks the humans out the day the gate flips on. Apply the same question to a new
+write, and answer it in the commit that adds the write.
+
+The guard is **gated off** by `qits.auth.machine.required` (default `false`, shipped by
+`qits-auth-core`). Off, `require()` returns at once and the intake behaves exactly as it did before
+the guard existed, which is what lets the code deploy before qits-idp does. A deployment sets
+`QITS_AUTH_MACHINE_REQUIRED=true` only once qits-ci is actually sending a bearer — the notifier
+swallows delivery failures at debug, so a premature flip stops deployments silently.
 
 The intake path is a **cross-repo contract**: qits-ci's `CdBuildNotifier` POSTs
 `/cd/api/events/build-succeeded` fire-and-forget via its `qits.cd.intake-url`. A mismatch raises

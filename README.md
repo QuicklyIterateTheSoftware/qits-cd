@@ -127,16 +127,22 @@ and a list already present makes that a one-line change. Two traps travel with i
 the values are matched **after** `ui-root-path` is stripped, so they are relative — `/cd/api`
 written there matches nothing at all and is indistinguishable from not setting the key.
 
-There is **no machine token** in this service, and that is a decision, not an omission. Nothing of
-cd is on the gateway's token-free allowlist, so every `/cd/*` path — the intake included — is
-session-guarded at the front door; on qits-net, callers are trusted, and that is where qits-ci's
-notifier and the epic orchestration actually dial. The `qits.ci.token` pattern exists for paths
-that *are* allowlisted at the gateway (ci's intake is; cd's is not, because its sender never
-traverses the gateway). Hardening intra-network machine surfaces is a later, platform-wide
-decision, deliberately not half-solved here — and if the intake ever needs a session-free
-front-door spelling, the gateway allowlist entry and a write guard here land in the same change.
-User identity is the gateway's `X-Qits-User` header (see `service/…/security/`); this service
-authenticates nothing and authorizes nothing.
+There is **no static machine token** in this service and there never was one. Two tracks of identity
+reach it instead, and both come from `qits-auth-core` (the `qits-integrations-quarkus` submodule
+this reactor builds):
+
+- **Users** arrive through qits-gateway, which performs the login and asserts `X-Qits-User`. The
+  environment surface is theirs; it authorizes nothing beyond that.
+- **Machines** arrive with a bearer from qits-idp, validated here by `quarkus-oidc` against
+  `aud=qits-cd`. The build-succeeded intake calls `MachineAuth.require()` — it is the one path
+  nothing human reaches, so a bearer is the only credential its caller could ever hold. The
+  environment writes stay unguarded for the mirror-image reason: a person drives them.
+
+**The guard is off until a deployment turns it on.** `qits.auth.machine.required` defaults to
+`false`, and off, `require()` returns at once — the intake accepts credential-free calls from
+qits-net exactly as before. `QITS_AUTH_MACHINE_REQUIRED=true` flips it, and only after qits-ci is
+actually sending a bearer: the notifier swallows delivery failures at debug, so a premature flip
+stops deployments and says nothing.
 
 The intake is a **fire-and-forget contract**: qits-ci's notifier swallows delivery failures at
 debug, so a path mismatch between the two repos raises no error anywhere and deployments simply
