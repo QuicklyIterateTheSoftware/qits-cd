@@ -62,7 +62,7 @@
             <artifactId>quarkus-security</artifactId>
         </dependency>
         <dependency>
-            <!-- The platform's shared auth code, from the qits-integrations-quarkus submodule:
+            <!-- The platform's shared auth code, resolved from the platform Maven repository:
                  ForwardAuthMechanism (qits-gateway's X-Qits-User header for user traffic — this
                  service's own copy was deleted when the jar arrived) and MachineAuth (the claim
                  guard over machine tokens, behind the qits.auth.machine.required gate). It ships

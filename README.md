@@ -128,8 +128,7 @@ the values are matched **after** `ui-root-path` is stripped, so they are relativ
 written there matches nothing at all and is indistinguishable from not setting the key.
 
 There is **no static machine token** in this service and there never was one. Two tracks of identity
-reach it instead, and both come from `qits-auth-core` (the `qits-integrations-quarkus` submodule
-this reactor builds):
+reach it instead, and both come from the published `qits-auth-core` library:
 
 - **Users** arrive through qits-gateway, which performs the login and asserts `X-Qits-User`. The
   environment surface is theirs; it authorizes nothing beyond that.
@@ -165,10 +164,8 @@ That gives this repo a clone rule with two halves:
 
 - **The test suite needs neither node nor the client submodule.** Quinoa is disabled by default in
   test mode (`Quinoa is disabled by default in tests.`), so every `@QuarkusTest` here is green
-  against an empty `webui/` on a machine with no node at all — `./mvnw test`. The *other* submodule,
-  `qits-integrations-quarkus`, is a reactor module and is needed by every command: without it maven
-  stops at `Child module … does not exist` before a line compiles.
-- **Anything that reaches `package` needs both**, and that includes `./mvnw verify`, which runs
+  against an empty `webui/` on a machine with no node at all — `./mvnw test`.
+- **Anything that reaches `package` needs the client**, and that includes `./mvnw verify`, which runs
   `package` on its way to failsafe. An uninitialised gitlink is an *empty directory*, and that is
   the one case Quinoa treats as a misconfiguration rather than "no client": augmentation stops at
   `No package.json found in Web UI directory`. This holds for every SPA-serving service, not just

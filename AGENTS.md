@@ -52,8 +52,7 @@ package:
 - `service/` — `api` (the JAX-RS routes and `CdExceptionMapper`) and `dockerhost`
   (`DockerDeploymentDriver` — the sole implementation of the seam, kept here because it is cd's
   whole relationship with the host's docker daemon). There is no `security` package any more: the
-  forward-auth pair moved to `qits-auth-core`, in the `qits-integrations-quarkus` submodule this
-  reactor builds.
+  forward-auth pair moved to the published `qits-auth-core` library.
 
 One package sits outside that tree: `eu.wohlben.qits.webui`, holding `WebUiRedirect` and only that.
 It keeps the sibling services' spelling rather than taking a `cd`-flavoured one, so the file is
@@ -200,12 +199,10 @@ keep appending, never edit an applied migration.
 
 ## Dependencies
 
-**Two submodules, and a build needs both.** `service/src/main/webui` is qits-spa-cd (the client)
-and `qits-integrations-quarkus` is the platform's shared Quarkus glue, listed first in the reactor
-and built in place — the shape qits-ci uses for `eventstream`. An uninitialised one fails as
-maven's `Child module … does not exist` or Quinoa's `No package.json found in Web UI directory`,
-neither of which names the cause. `git submodule update --init` is half of a clone here, and
-`.config/qits/ci-post-receive.yml` runs it for the same reason.
+**The client is the only submodule.** `service/src/main/webui` is qits-spa-cd. An uninitialised
+checkout fails with Quinoa's `No package.json found in Web UI directory`; `git submodule update
+--init` is half of a clone here, and `.config/qits/ci-post-receive.yml` runs it for that reason.
+Shared auth comes from the platform Maven repository as `qits-auth-core:1.0.0`.
 
 **`quarkus-undertow` must never be on the classpath.** Its presence breaks Quinoa's production
 static serving — the client 404s from a build that was green — and it arrives *transitively* from
