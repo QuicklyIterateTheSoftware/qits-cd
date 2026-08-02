@@ -8,9 +8,9 @@
 #   2. build this repo's docker/Dockerfile, whose builder stage packages that already-built bundle
 #      and never runs an install.
 #
-# A RUN step inside a docker build reaches the public internet but reaches the platform registry by
-# no address at all (not the qits-net alias, not localhost:8081, not host.docker.internal). That is
-# why the halves are split, and it is why this step's image is node-docker-base rather than ci-base:
+# The Docker build uses the host network so Maven can resolve qits-auth-core from the platform's
+# host-published registry at localhost:8081. The frontend still builds in this step container because
+# its npm registry is addressed by the qits-net service alias. That is why the halves are split:
 # it needs node, npm and git for half one and the docker CLI for half two. The same split, for the
 # same reason, as every other SPA-serving service's pipeline — they should keep matching.
 #
@@ -81,6 +81,6 @@ steps:
       cd -
 
       ref="$QITS_REGISTRY/$QITS_IMAGE_REPOSITORY/qits-cd:$QITS_CI_SHA"
-      docker build -t "$ref" -f docker/Dockerfile .
+      docker build --network host -t "$ref" -f docker/Dockerfile .
       docker push "$ref"
       docker rmi "$ref" || true
