@@ -20,7 +20,7 @@
          (`eu.wohlben.qits:qits-cd-*`) so generic module names cannot collide in a shared ~/.m2. -->
     <groupId>eu.wohlben.qits</groupId>
     <artifactId>qits-cd</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
+    <version>2026.802.160308</version>
     <packaging>pom</packaging>
     <name>qits-cd</name>
 
@@ -31,7 +31,7 @@
     </modules>
 
     <properties>
-        <qits.auth-core.version>1.0.0</qits.auth-core.version>
+        <qits.auth-core.version>2026.802.154953</qits.auth-core.version>
         <qits.maven.repository.url>http://localhost:8081/artifacts/maven/maven</qits.maven.repository.url>
         <maven.compiler.release>25</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
