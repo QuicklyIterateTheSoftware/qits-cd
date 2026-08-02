@@ -93,6 +93,8 @@ steps:
 
       # --- half two: the image ------------------------------------------------------------------
       ref="$QITS_REGISTRY/$QITS_IMAGE_REPOSITORY/qits-cd:$version"
-      docker build -t "$ref" -f docker/Dockerfile .
+      docker build --network qits-net \
+        --build-arg QITS_MAVEN_REPOSITORY_URL=http://qits-artifacts:8080/artifacts/maven/maven \
+        -t "$ref" -f docker/Dockerfile .
       docker push "$ref"
       docker rmi "$ref" || true
