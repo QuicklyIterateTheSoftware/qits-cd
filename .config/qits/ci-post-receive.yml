@@ -37,7 +37,8 @@ steps:
       set -eu
 
       # The daemon's shallow clone does not recurse, so initialise the packaged SPA explicitly.
-      git submodule update --init --depth 1 service/src/main/webui
+      frontend_url="${QITS_CI_REPOSITORY_URL%/*}/qits-spa-cd"
+      git -c submodule.qits-spa-cd.url="$frontend_url" submodule update --init --depth 1 service/src/main/webui
 
       # THE LOCKFILE is the one file this step edits, and npm leaves no alternative.
       #
