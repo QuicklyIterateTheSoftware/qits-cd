@@ -8,9 +8,8 @@
 #   2. build this repo's docker/Dockerfile, whose builder stage packages that already-built bundle
 #      and never runs an install.
 #
-# The Docker build uses the host network so Maven can resolve qits-auth-core from the platform's
-# host-published registry at localhost:8081. The frontend still builds in this step container because
-# its npm registry is addressed by the qits-net service alias. That is why the halves are split:
+# The Docker build joins qits-net and Maven resolves qits-auth-core directly from qits-artifacts.
+# The frontend also builds in this step container because its npm registry uses that service alias.
 # it needs node, npm and git for half one and the docker CLI for half two. The same split, for the
 # same reason, as every other SPA-serving service's pipeline — they should keep matching.
 #
@@ -81,6 +80,8 @@ steps:
       cd -
 
       ref="$QITS_REGISTRY/$QITS_IMAGE_REPOSITORY/qits-cd:$QITS_CI_SHA"
-      docker build --network host -t "$ref" -f docker/Dockerfile .
+      docker build --network qits-net \
+        --build-arg QITS_MAVEN_REPOSITORY_URL=http://qits-artifacts:8080/artifacts/maven/maven \
+        -t "$ref" -f docker/Dockerfile .
       docker push "$ref"
       docker rmi "$ref" || true
