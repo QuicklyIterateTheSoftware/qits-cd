@@ -20,7 +20,7 @@
          (`eu.wohlben.qits:qits-cd-*`) so generic module names cannot collide in a shared ~/.m2. -->
     <groupId>eu.wohlben.qits</groupId>
     <artifactId>qits-cd</artifactId>
-    <version>2026.802.171512</version>
+    <version>2026.802.174552</version>
     <packaging>pom</packaging>
     <name>qits-cd</name>
 
