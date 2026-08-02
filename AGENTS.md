@@ -49,9 +49,11 @@ package:
   (`EnvironmentService`, `DeployService`), the validation (`CdIdentifiers`), the shell-out
   (`CdProcess`), the image-reference convention (`ImageRefs`) and the docker seam
   (`DeploymentDriver`).
-- `service/` — `api` (the JAX-RS routes and `CdExceptionMapper`), `security` (the forward-auth
-  pair), and `dockerhost` (`DockerDeploymentDriver` — the sole implementation of the seam, kept
-  here because it is cd's whole relationship with the host's docker daemon).
+- `service/` — `api` (the JAX-RS routes and `CdExceptionMapper`) and `dockerhost`
+  (`DockerDeploymentDriver` — the sole implementation of the seam, kept here because it is cd's
+  whole relationship with the host's docker daemon). There is no `security` package any more: the
+  forward-auth pair moved to `qits-auth-core`, in the `qits-integrations-quarkus` submodule this
+  reactor builds.
 
 One package sits outside that tree: `eu.wohlben.qits.webui`, holding `WebUiRedirect` and only that.
 It keeps the sibling services' spelling rather than taking a `cd`-flavoured one, so the file is
@@ -130,12 +132,27 @@ regression.
 suite inherits it — a resource's `@Path` is relative to it and must never repeat `cd`; tests
 address the absolute path, which is what makes them catch a prefix regression.
 
-There is **no machine token in this service** — nothing of cd is on the gateway's token-free
-allowlist, so every `/cd/*` path is session-guarded at the front door, and qits-net callers are
-trusted (that is where the intake's sender actually dials). The `qits.ci.token` pattern belongs to
-paths that are allowlisted at the gateway; do not reintroduce it here without the allowlist entry
-that would give it a job, and never the allowlist entry without the guard — qits-gateway's
-`PublicPathsTest.nothingOfCdIsPublic` is what makes that a conscious pair of changes.
+There is **no static machine token in this service** and none is ever to be added. Machine callers
+present a qits-idp bearer, validated by `quarkus-oidc` against `aud=qits-cd` and checked by
+`qits-auth-core`'s `MachineAuth`. Nothing of cd is on the gateway's token-free allowlist either, so
+every `/cd/*` path is also session-guarded at the front door — qits-gateway's
+`PublicPathsTest.nothingOfCdIsPublic` pins that.
+
+**Where `machineAuth.require()` goes, and where it does not.** On a path nothing human reaches, so
+a bearer is the only credential its caller could hold — today that is exactly the build-succeeded
+intake. Not on the environment surface: a person drives it through the gateway's session, and a
+guard there locks the humans out the day the gate flips on. Apply the same question to a new
+write, and answer it in the commit that adds the write.
+
+The guard is **gated off** by `qits.auth.machine.required` (default `false`, shipped by
+`qits-auth-core`). Off, `require()` returns at once and the intake behaves exactly as it did before
+the guard existed, which is what lets the code deploy before qits-idp does. A deployment sets
+`QITS_AUTH_MACHINE_REQUIRED=true` only once qits-ci is actually sending a bearer — the notifier
+swallows delivery failures at debug, so a premature flip stops deployments silently.
+
+Validation follows that same gate: `quarkus.oidc.tenant-enabled=${qits.auth.machine.required:false}`.
+Gate off, there is no OIDC tenant — nothing fetches a JWKS and a clone-alone build needs no issuer.
+There is no third state. qits-ci and qits-artifacts carry the same line.
 
 The intake path is a **cross-repo contract**: qits-ci's `CdBuildNotifier` POSTs
 `/cd/api/events/build-succeeded` fire-and-forget via its `qits.cd.intake-url`. A mismatch raises
@@ -183,6 +200,13 @@ keep appending, never edit an applied migration.
 
 ## Dependencies
 
+**Two submodules, and a build needs both.** `service/src/main/webui` is qits-spa-cd (the client)
+and `qits-integrations-quarkus` is the platform's shared Quarkus glue, listed first in the reactor
+and built in place — the shape qits-ci uses for `eventstream`. An uninitialised one fails as
+maven's `Child module … does not exist` or Quinoa's `No package.json found in Web UI directory`,
+neither of which names the cause. `git submodule update --init` is half of a clone here, and
+`.config/qits/ci-post-receive.yml` runs it for the same reason.
+
 **`quarkus-undertow` must never be on the classpath.** Its presence breaks Quinoa's production
 static serving — the client 404s from a build that was green — and it arrives *transitively* from
 anything servlet-shaped. Check before adding anything that sounds like a web framework:
@@ -198,7 +222,17 @@ when the platform's Quarkus passes the version a release is built against.
 
 - App-level config lives in `service/src/main/resources/application.properties` and Quarkus merges
   it into the test config. **Never re-declare an app-level setting in test resources** — the test
-  copy carries only the in-memory H2.
+  copy carries only what a test run genuinely needs to be different: the port, the in-memory H2,
+  and `quarkus.devservices.enabled=false`.
+- **No dev services, ever.** A dev service is a container start, and the first rule here is that a
+  clone tests green with no docker. `quarkus-oidc` in particular launches a real Keycloak the
+  moment a profile leaves `quarkus.oidc.auth-server-url` unset — measured, not feared. One line in
+  the test resources shuts all of them off; keep it.
+- **Machine-token tests mint their own tokens.** `MachineTokens` signs RS256 with the key pair in
+  `service/src/test/resources/machine-token-*.pem`, and `MachineGuardEnforcedProfile` hands
+  quarkus-oidc the public half, so the enforced path is exercised end to end with no qits-idp to
+  reach. Those PEMs are **test fixtures, not credentials** — nothing outside the suite has ever
+  seen them, and no deployment key belongs in this repo.
 - `FakeDeploymentDriver` is `@Mock` and application-scoped, so it is shared across tests: reset it
   in `@BeforeEach`, use distinct environment names per test, and read its state through its
   **methods** — the injected reference is a CDI client proxy, and a field read on a proxy sees the
@@ -209,7 +243,8 @@ when the platform's Quarkus passes the version a release is built against.
   changes: `./mvnw -pl service -am test -Dtest=OpenApiSchemaExportTest
   -Dsurefire.failIfNoSpecifiedTests=false`. The intake is `@Operation(hidden = true)` (a wire
   API); the environment and deployment surfaces are the document. The test classpath is indexed
-  too, which is why `IdentityEchoResource` is hidden.
+  too, so a new `@Path` resource under `src/test` lands in the committed document unless it is
+  hidden.
 - `CdPackagedSurfaceIT` runs the **packaged artifact** (fast-jar under `-DskipITs=false`, binary
   under `-Dnative`) and asserts what a native build can silently lose: the build-time route
   prefixes, the shipped ${user.home}-rooted H2 default (it relocates `user.home` rather than

@@ -30,6 +30,12 @@ import org.eclipse.microprofile.openapi.annotations.responses.APIResponse;
  * <p>Deliberately <b>not</b> {@code @Operation(hidden = true)}: unlike the intake, this is the API
  * of this service — the thing a client (human or the epic orchestration) is written against — so it
  * belongs in the document one is generated from.
+ *
+ * <p><b>No {@code MachineAuth} guard, deliberately.</b> These writes are reachable by a person
+ * through qits-gateway's session, so a bearer is not the only credential a caller could hold, and
+ * demanding one would lock the humans out the day the gate flips on. The build-succeeded intake is
+ * the opposite — machine-only — and carries the guard. When the epic orchestration becomes a real
+ * machine sender, giving it a token and guarding these two writes is one change, not this one.
  */
 @Path("/environments")
 @Produces(MediaType.APPLICATION_JSON)

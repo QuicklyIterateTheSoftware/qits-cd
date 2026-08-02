@@ -121,6 +121,11 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/CdEnvironmentDto"
+  securitySchemes:
+    SecurityScheme:
+      type: openIdConnect
+      openIdConnectUrl: http://qits-idp:8080/idp/.well-known/openid-configuration
+      description: Authentication
 paths:
   /cd/api/deployments:
     get:

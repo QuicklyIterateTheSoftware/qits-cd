@@ -12,10 +12,10 @@
     </parent>
 
     <!-- The cd REST boundary and the docker seam: `eu.wohlben.qits.cd.api` (the environment
-         surface, the build-succeeded intake, the static-token filter over the write surface, the
-         CdException -> HTTP mapper), `security` (the forward-auth header identity), and
-         `dockerhost` (DockerDeploymentDriver — the sole implementation of the DeploymentDriver
-         seam, kept here because it is cd's whole relationship with the host's docker daemon).
+         surface, the build-succeeded intake, the CdException -> HTTP mapper) and `dockerhost`
+         (DockerDeploymentDriver — the sole implementation of the DeploymentDriver seam, kept here
+         because it is cd's whole relationship with the host's docker daemon). Identity is no
+         longer a package here: the forward-auth pair moved to qits-auth-core, below.
 
          A DEPLOYABLE APP, not a library JAR — <packaging>quarkus</packaging> binds augmentation
          into the lifecycle so it cannot be silently misplaced (the migration-deployables-plan.md
@@ -55,11 +55,31 @@
             <artifactId>quarkus-opentelemetry</artifactId>
         </dependency>
         <dependency>
-            <!-- SecurityIdentity + the HttpAuthenticationMechanism SPI, for the single thing this
-                 service does about auth: read qits-gateway's X-Qits-User header into an identity
-                 (see security/ForwardAuthMechanism). Authentication terminates at the gateway. -->
+            <!-- SecurityIdentity + the HttpAuthenticationMechanism SPI. Named here rather than
+                 taken transitively from qits-auth-core, because this module's own code reads a
+                 SecurityIdentity. -->
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-security</artifactId>
+        </dependency>
+        <dependency>
+            <!-- The platform's shared auth code, from the qits-integrations-quarkus submodule:
+                 ForwardAuthMechanism (qits-gateway's X-Qits-User header for user traffic — this
+                 service's own copy was deleted when the jar arrived) and MachineAuth (the claim
+                 guard over machine tokens, behind the qits.auth.machine.required gate). It ships
+                 the qits.auth.* defaults too, which is why this module no longer carries a
+                 META-INF/microprofile-config.properties of its own: two files at ordinal 100
+                 holding one key make the winner arbitrary. -->
+            <groupId>${project.groupId}</groupId>
+            <artifactId>qits-auth-core</artifactId>
+        </dependency>
+        <dependency>
+            <!-- Bearer validation against qits-idp. qits-auth-core deliberately does NOT bring it:
+                 validating a token is each service's own choice of extension and config, and the
+                 jar only reads the identity that validation leaves behind. Configured in
+                 application.properties; with the rollout gate off nothing here demands a token,
+                 and a request with no Authorization header still falls through to forward-auth. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-oidc</artifactId>
         </dependency>
         <dependency>
             <groupId>io.quarkus</groupId>
@@ -94,6 +114,15 @@
         <dependency>
             <groupId>io.rest-assured</groupId>
             <artifactId>rest-assured</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <!-- Test-only token issuer. The gate-on suite signs its own RS256 tokens with the key
+                 pair in src/test/resources and has quarkus-oidc verify them locally, so the
+                 enforcement path is exercised end to end — signature, issuer, audience, guard —
+                 with no qits-idp to reach. Nothing in src/main mints a token. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-smallrye-jwt-build</artifactId>
             <scope>test</scope>
         </dependency>
     </dependencies>

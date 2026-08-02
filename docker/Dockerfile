@@ -7,7 +7,7 @@
 #
 # Build from the repo root:
 #
-#     git submodule update --init service/src/main/webui
+#     git submodule update --init
 #     (cd service/src/main/webui && npm ci && npm run build)
 #     docker build -t qits/cd:latest -f docker/Dockerfile .
 #
@@ -46,8 +46,18 @@
 #                           warning per export loudly enough to bury real lines
 #                           (OTEL_SDK_DISABLED=true is the escape hatch).
 #
-# There is no QITS_CD_TOKEN: nothing of cd is on the gateway's token-free allowlist, so every
-# /cd/* path is session-guarded at the front door, and qits-net callers are trusted.
+# There is no QITS_CD_TOKEN: cd has no static machine token. Machine callers present a qits-idp
+# bearer instead, and one env var decides whether that is demanded:
+#
+#   QITS_AUTH_MACHINE_REQUIRED
+#                           unset (the shipped state) the build-succeeded intake accepts the
+#                           credential-free call qits-ci makes today. `true` demands a token minted
+#                           for qits-cd on that path — set it only once qits-idp is up AND qits-ci
+#                           is sending one, because the sender swallows delivery failures at debug
+#                           and a premature flip stops deployments silently.
+#   QUARKUS_OIDC_AUTH_SERVER_URL
+#                           the idp, default http://qits-idp:8080/idp on qits-net. Unreachable is a
+#                           WARN at boot, never a failed start.
 #
 # --- READ THIS BEFORE DEPLOYING: cd does its work by shelling out --------------------------------
 # The docker CLI is installed below, but it is only half of what a deployment has to supply, and

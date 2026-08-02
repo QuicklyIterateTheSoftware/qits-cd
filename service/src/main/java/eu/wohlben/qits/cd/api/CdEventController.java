@@ -1,5 +1,6 @@
 package eu.wohlben.qits.cd.api;
 
+import eu.wohlben.qits.auth.MachineAuth;
 import eu.wohlben.qits.cd.control.DeployService;
 import jakarta.inject.Inject;
 import jakarta.validation.Valid;
@@ -20,10 +21,13 @@ import org.eclipse.microprofile.openapi.annotations.Operation;
  * anywhere; deployments just stop happening. The path carries no {@code cd} segment of its own
  * because {@code quarkus.rest.path=/cd/api} already says it.
  *
- * <p>Hidden from the OpenAPI document (a wire/system API). Carries no token guard: unlike ci's
- * intake this path is NOT on the gateway's token-free allowlist — the sender dials it directly on
- * qits-net, so the front door session-guards it and the network trusts it. If it is ever
- * allowlisted at the gateway, a write guard here must land in the same change.
+ * <p>Hidden from the OpenAPI document (a wire/system API).
+ *
+ * <p><b>The one machine-only path in this service</b>, and therefore the one that carries {@link
+ * MachineAuth#require()}. Nothing human reaches it: qits-ci is its only sender. The environment
+ * surface next door is the opposite case — a person drives it through the gateway's session — so it
+ * stays on forward-auth and gains no guard. That split is the rule here, not a phasing: {@code
+ * require()} belongs where a bearer is the only credential a caller could ever hold.
  */
 @Path("/events")
 @Produces(MediaType.APPLICATION_JSON)
@@ -31,6 +35,7 @@ import org.eclipse.microprofile.openapi.annotations.Operation;
 public class CdEventController {
 
   @Inject DeployService deployService;
+  @Inject MachineAuth machineAuth;
 
   /**
    * One green pipeline for one commit. The triple that matters is (repoId, branch, commitSha) — cd
@@ -46,11 +51,20 @@ public class CdEventController {
    * Accepts the event and returns immediately — deployments execute on cd's worker. 202 also when
    * no environment listens to the branch: that is the normal case for every green build on a branch
    * without an environment, not an error the fire-and-forget sender could act on.
+   *
+   * <p>{@code require()} and not {@code requireProject(...)}: the event names a {@code repoId}, and
+   * a repository is not a project. Holding a token minted for qits-cd is the whole claim this
+   * intake needs — it queues a deployment onto whichever environment already listens to the branch,
+   * and which environments exist is cd's own configuration, not the caller's to name.
+   *
+   * <p>With the gate off this line returns at once and the endpoint accepts credential-free calls
+   * from qits-net exactly as it did before.
    */
   @POST
   @Path("/build-succeeded")
   @Operation(hidden = true)
   public Response buildSucceeded(@Valid BuildSucceededEvent event) {
+    machineAuth.require();
     deployService.onBuildSucceeded(
         event.runId(), event.repoId(), event.branch(), event.commitSha());
     return Response.accepted().build();
