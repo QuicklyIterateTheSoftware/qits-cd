@@ -25,17 +25,7 @@
     <name>qits-cd</name>
 
     <modules>
-        <!-- Listed in dependency order: `service` depends on both.
-
-             `qits-integrations-quarkus` is a SUBMODULE — another repository, checked out here so
-             the reactor builds it in place, the same shape qits-ci uses for `eventstream`. Its pom
-             is parentless and carries its own groupId and version; the reactor resolves it as a
-             module all the same. It is an AGGREGATOR rather than one jar, so whatever modules it
-             grows arrive without another edit here. A clone that has not initialised its
-             submodules has no such directory and the build fails at once with `Child module ...
-             does not exist`, which is the intended signal — see AGENTS.md for the command that
-             fixes it. -->
-        <module>qits-integrations-quarkus</module>
+        <!-- Listed in dependency order: `service` depends on `cd`. -->
         <module>cd</module>
         <module>service</module>
     </modules>
