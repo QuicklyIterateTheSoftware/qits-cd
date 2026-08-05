@@ -443,16 +443,82 @@ public class DockerDeploymentDriver implements DeploymentDriver {
     // application config (datasources, peers) is the image's and the environment's own story.
     env(argv, "QITS_ENVIRONMENT", spec.environmentName());
     env(argv, "QITS_APPLICATION", spec.applicationName());
+    // The same identity again, in the vocabulary OpenTelemetry reads (see resourceAttributes).
+    String resourceAttributes = resourceAttributes(spec);
+    env(argv, "OTEL_RESOURCE_ATTRIBUTES", resourceAttributes);
+    env(argv, "QUARKUS_OTEL_RESOURCE_ATTRIBUTES", resourceAttributes);
     // The deployment's own additions for this application — qits.cd.run-args.<name>, whitespace
     // split, no re-quoting (an argument that needs a space in it does not fit this seam). The
     // application name was already dns-label-validated at the boundary, so the assembled key
     // cannot escape the family.
+    //
+    // THEY GO LAST, AND THAT IS THE PRECEDENCE RULE: docker keeps the LAST assignment of a
+    // repeated env key (measured: `docker run -e FOO=first -e FOO=second` leaves one FOO, and it
+    // is `second`). So every variable cd sets above is a DEFAULT the operator can override by
+    // naming the same key in run-args, and cd never overwrites what an operator wrote. The
+    // injection composes with the operator's arguments rather than fighting them.
     config
         .getOptionalValue(RUN_ARGS_PREFIX + spec.applicationName(), String.class)
         .filter(raw -> !raw.isBlank())
         .ifPresent(raw -> argv.addAll(Arrays.asList(raw.trim().split("\\s+"))));
     argv.add(spec.imageRef());
     return List.copyOf(argv);
+  }
+
+  /**
+   * The deployed container's OpenTelemetry resource identity, as the standard {@code k=v,k=v} list.
+   * Three attributes, each a value cd genuinely holds at this point and none invented:
+   *
+   * <ul>
+   *   <li>{@code service.version} — the deployment's commit sha. cd deploys sha-addressed images,
+   *       so the sha IS the released identity; it is not a version number and is not dressed up as
+   *       one.
+   *   <li>{@code deployment.environment.name} — the environment this container belongs to.
+   *   <li>{@code service.instance.id} — the container name cd assigned, which is unique per
+   *       deployment and stable for the process' lifetime.
+   * </ul>
+   *
+   * <p>Nothing else. In particular no {@code qits.workspace.id} or {@code qits.repository.id}: a
+   * platform service has neither, and stamping a fake one to fit an old query model is what the
+   * log-streaming plan forbids. {@code service.name} is left alone — each image sets it from its own
+   * {@code quarkus.application.name}, which is what the observability source list buckets on.
+   *
+   * <p><b>Why two variables carry one value.</b> {@code OTEL_RESOURCE_ATTRIBUTES} is the
+   * vendor-neutral spelling every OpenTelemetry SDK reads, and it is the contract; it is written
+   * first and alone would be the whole of this method. But it does not win everywhere, and the one
+   * place it loses is the one attribute that matters most here. Measured against the platform's
+   * Quarkus 3.34.6, the SDK resource is assembled in this order (lowest precedence first):
+   *
+   * <ol>
+   *   <li>the SDK's autoconfigured environment resource — where {@code OTEL_RESOURCE_ATTRIBUTES}
+   *       lands;
+   *   <li>Quarkus' own build-time attributes ({@code service.name}, {@code service.version} from
+   *       the pom stamp, {@code webengine.*}), merged OVER the previous;
+   *   <li>{@code quarkus.otel.resource.attributes} — i.e. {@code QUARKUS_OTEL_RESOURCE_ATTRIBUTES}
+   *       — merged over everything.
+   * </ol>
+   *
+   * <p>So the environment name and the instance id arrive from the neutral variable (Quarkus stamps
+   * neither), while a {@code service.version} written only there is silently replaced by the pom
+   * version baked into the image at build time — the stale identity this injection exists to
+   * correct. The Quarkus-spelled variable is the layer that outranks the stamp. Both carry the same
+   * string, built once here, so the two cannot disagree; a non-Quarkus image simply ignores the
+   * second name.
+   */
+  private static String resourceAttributes(StartSpec spec) {
+    // Belt at the argv, the health-path stance: a comma or an equals sign in any of these would
+    // forge an extra attribute, and each value is already validated at the boundary as a sha or a
+    // dns label. This is what makes loosening one of those checks a failed deployment instead.
+    String version = CdIdentifiers.requireAttributeValue(spec.commitSha(), "commit sha");
+    String environment =
+        CdIdentifiers.requireAttributeValue(spec.environmentName(), "environment name");
+    String instance = CdIdentifiers.requireAttributeValue(spec.containerName(), "container name");
+    return "service.version="
+        + version
+        + ",deployment.environment.name="
+        + environment
+        + ",service.instance.id="
+        + instance;
   }
 
   private static void env(List<String> argv, String key, String value) {

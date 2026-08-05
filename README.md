@@ -87,8 +87,31 @@ neither instance referees its own succession.
   The source matters more than the feature: the environments API is deliberately open on qits-net,
   so nothing arriving over HTTP may shape a `docker run` argv — these arguments live in the same
   trust domain as the socket cd already holds, and changing them is a config diff on the
-  deployment, visible like any other. Without an entry a container still gets exactly
-  `QITS_ENVIRONMENT` and `QITS_APPLICATION` and nothing else.
+  deployment, visible like any other. Without an entry a container still gets exactly the
+  identity variables below and nothing else. They are written *before* the run arguments, and
+  docker keeps the last assignment of a repeated env key — so cd's variables are defaults an
+  operator overrides by naming the same key, never the other way round.
+- **The container is told who it is, in OpenTelemetry's vocabulary.** Every started container gets
+  `QITS_ENVIRONMENT`, `QITS_APPLICATION`, and the resource identity the platform's logs and traces
+  are bucketed by:
+
+      OTEL_RESOURCE_ATTRIBUTES=service.version=<commit sha>,deployment.environment.name=<env>,service.instance.id=<container name>
+      QUARKUS_OTEL_RESOURCE_ATTRIBUTES=<the same string>
+
+  Three attributes, each a value cd genuinely holds: the deployment's sha (cd deploys
+  sha-addressed images, so the sha *is* the released identity — it is not dressed up as a version
+  number), the environment's name, and the container name cd just assigned. No workspace or
+  repository ids: a platform service has neither.
+
+  The second variable is not a duplicate by accident. Measured against Quarkus 3.34.6, the SDK
+  resource is merged lowest-precedence-first as (1) the autoconfigured environment resource, where
+  `OTEL_RESOURCE_ATTRIBUTES` lands, (2) Quarkus' build-time attributes — `service.name`,
+  `service.version` **from the pom stamp**, `webengine.*` — over it, (3)
+  `quarkus.otel.resource.attributes` over everything. So the neutral variable alone delivers the
+  environment name and instance id but has its `service.version` silently replaced by the version
+  baked into the image at build time, which is the stale identity this exists to correct. Both
+  variables are built from one string, so they cannot disagree, and a non-Quarkus image ignores
+  the second name.
 - **Containers carry labels** (`qits.cd.environment`, `qits.cd.application`,
   `qits.cd.deployment`), and teardown finds them by label — so even containers whose rows are gone
   cannot be orphaned invisibly.
@@ -191,7 +214,8 @@ does this, for the same reason.
   the contract and does not exist yet; this service is the receiving half, complete and testable
   without it.
 - **A templating engine for application config.** A deployed container gets `QITS_ENVIRONMENT`,
-  `QITS_APPLICATION`, and whatever the deployment's own `qits.cd.run-args.<name>` names (see the
+  `QITS_APPLICATION`, its OTel resource identity, and whatever the deployment's own
+  `qits.cd.run-args.<name>` names (see the
   conventions above) — cd itself renders nothing, resolves nothing and stores nothing per
   application beyond that config family. Datasources, peer addresses and secrets stay the image's
   and the deployment's own story; cd only carries the deployment's words to `docker run`.

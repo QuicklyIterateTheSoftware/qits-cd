@@ -125,6 +125,13 @@ open on qits-net, and config is the trust domain that already holds the socket.
 security property. A `docker exec`, or run-args growing an HTTP-writable source, is the
 regression.
 
+cd's own env flags (`QITS_ENVIRONMENT`, `QITS_APPLICATION`, `OTEL_RESOURCE_ATTRIBUTES` and its
+`QUARKUS_`-spelled twin) are written **before** the run args, and docker keeps the **last**
+assignment of a repeated key — measured, not assumed. So they are defaults an operator overrides,
+and the ordering is the precedence rule: never reorder them past the run args.
+`CdIdentifiers.requireAttributeValue` is the argv-side belt on the resource attributes, the same
+stance as `requireHealthPath` — a comma or an equals sign in a value would forge an extra pair.
+
 ## Addressing
 
 `quarkus.rest.path=/cd/api` lives in `service/src/main/resources/application.properties` and the

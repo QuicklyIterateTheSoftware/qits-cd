@@ -45,6 +45,13 @@ public final class CdIdentifiers {
    */
   private static final String HEALTH_PATH = "/[A-Za-z0-9._/-]{0,254}";
 
+  /**
+   * One value of an {@code OTEL_RESOURCE_ATTRIBUTES} pair. The list's own separators are the guard's
+   * whole subject: {@code ,} would forge a second pair and {@code =} would move the boundary
+   * between key and value, so neither is in the charset.
+   */
+  private static final String ATTRIBUTE_VALUE = "[A-Za-z0-9._/:-]{1,255}";
+
   private CdIdentifiers() {}
 
   /**
@@ -131,5 +138,23 @@ public final class CdIdentifiers {
           "Invalid health path — an absolute path of letters, digits, dots, dashes and slashes");
     }
     return healthPath;
+  }
+
+  /**
+   * One value of a resource-attribute pair, checked at the argv rather than at the boundary — the
+   * second belt of the same kind as {@link #requireHealthPath}. Every value cd puts in that list is
+   * already a validated sha, a validated name, or a container name cd composed out of both, so this
+   * can only fail if one of those checks is ever loosened; it is here so that loosening one is a
+   * failed deployment rather than a forged extra attribute.
+   *
+   * @throws BadRequestException if the value carries a {@code ,} or {@code =} the list would read
+   *     as its own punctuation
+   */
+  public static String requireAttributeValue(String value, String what) {
+    if (value == null || !value.matches(ATTRIBUTE_VALUE)) {
+      throw new BadRequestException(
+          "Invalid " + what + " — no commas or equals signs in a resource attribute value");
+    }
+    return value;
   }
 }

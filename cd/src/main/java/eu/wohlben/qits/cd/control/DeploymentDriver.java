@@ -77,13 +77,20 @@ public interface DeploymentDriver {
   /** One container holding an application's alias: the full docker id and the container name. */
   record Holder(String id, String name) {}
 
-  /** Everything one container is started with. */
+  /**
+   * Everything one container is started with.
+   *
+   * <p>{@code commitSha} is carried beside {@code imageRef} rather than parsed back out of it: it
+   * is the deployment's own identity — the sha the row was created with and the image was
+   * addressed by — and it becomes the container's {@code service.version} resource attribute.
+   */
   record StartSpec(
       String environmentId,
       String environmentName,
       String applicationId,
       String applicationName,
       String deploymentId,
+      String commitSha,
       String network,
       String imageRef,
       String containerName,

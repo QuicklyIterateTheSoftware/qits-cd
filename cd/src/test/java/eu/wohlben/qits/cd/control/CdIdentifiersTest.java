@@ -93,4 +93,23 @@ class CdIdentifiersTest {
         "qits-cd-some-epic-qits-gateway-0123abcd",
         DeployService.containerName("some-epic", "qits-gateway", "0123abcd-ffff-4000-8000-0000"));
   }
+
+  @Test
+  void resourceAttributeValuesCarryNoListPunctuation() {
+    // The three values that go into OTEL_RESOURCE_ATTRIBUTES pass as they are today: a sha, an
+    // environment name, a container name cd composed from both.
+    assertEquals("a".repeat(40), CdIdentifiers.requireAttributeValue("a".repeat(40), "sha"));
+    assertEquals("some-epic", CdIdentifiers.requireAttributeValue("some-epic", "environment"));
+    assertEquals(
+        "qits-cd-some-epic-qits-gateway-0123abcd",
+        CdIdentifiers.requireAttributeValue(
+            "qits-cd-some-epic-qits-gateway-0123abcd", "container name"));
+    // The list's own punctuation is what the check exists for: a comma starts a second pair and an
+    // equals sign moves the key/value boundary.
+    for (String hostile : new String[] {null, "", "a,service.name=impostor", "a=b", " "}) {
+      assertThrows(
+          BadRequestException.class, () -> CdIdentifiers.requireAttributeValue(hostile, "x"),
+          String.valueOf(hostile));
+    }
+  }
 }

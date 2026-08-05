@@ -250,6 +250,11 @@ public class CdDeploymentFlowTest {
     DeploymentDriver.HandoffSpec handoff = driver.handoffs().get(0);
     assertEquals(selfFullId, handoff.oldContainerId());
     assertEquals(driver.started().get(0).containerName(), handoff.newContainerName());
+    // The successor is started through the same StartSpec as any other deployment, so it carries
+    // the same identity into the same argv builder: deploying cd itself is not a second code path
+    // that could miss the OTel resource attributes.
+    assertEquals(SHA_A, driver.started().get(0).commitSha());
+    assertEquals("flow-self", driver.started().get(0).environmentName());
     // Nothing stopped, nothing removed by THIS process — the referee owns retirement.
     assertEquals(List.of(), driver.stoppedContainers());
     assertEquals(List.of(), driver.removedContainers());
