@@ -132,6 +132,7 @@ segment is the client's.
 | `/cd/api/environments` | GET, POST | list; create (machine call from the epic orchestration) |
 | `/cd/api/environments/{id}` | GET, DELETE | one environment with its applications; teardown |
 | `/cd/api/deployments?environmentId=` | GET | an environment's deployments, newest-first |
+| `/cd/api/pins` | GET | the image shas deployments pin, across every environment: what serves and what a rollback restores. Read by qits-artifacts' image GC, which keeps what this names and aborts its sweep when cd cannot answer |
 | `/cd/api/events/build-succeeded` | POST | the qits-ci intake (hidden from the OpenAPI document) |
 | `/cd/q/openapi`, `/cd/q/swagger-ui` | GET | the API document |
 | `/cd/q/health/ready` | GET | the readiness endpoint this service's own health gate curls on a peer |

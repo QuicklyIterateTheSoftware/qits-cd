@@ -80,6 +80,15 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/CdApplicationDto"
+    CdPinDto:
+      type: object
+      properties:
+        applicationName:
+          type: string
+        shas:
+          type: array
+          items:
+            type: string
     CreateEnvironmentRequest:
       type: object
       required:
@@ -121,6 +130,13 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/CdEnvironmentDto"
+    ListPinsResponse:
+      type: object
+      properties:
+        pins:
+          type: array
+          items:
+            $ref: "#/components/schemas/CdPinDto"
   securitySchemes:
     SecurityScheme:
       type: openIdConnect
@@ -210,6 +226,19 @@ paths:
           description: No such environment
       tags:
       - Cd Environment Controller
+  /cd/api/pins:
+    get:
+      summary: "The image shas deployments pin: what serves, and what a rollback restores"
+      responses:
+        "200":
+          description: One entry per application name serving somewhere; an application
+            with no ACTIVE deployment pins nothing and is absent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListPinsResponse"
+      tags:
+      - Cd Pin Controller
 info:
   title: qits-cd API
   version: 2026.802.191319

@@ -16,6 +16,17 @@ public class CdDeploymentRepository implements PanacheRepositoryBase<CdDeploymen
         "application.environment.id = ?1 order by createdAt desc, id desc", environmentId);
   }
 
+  /**
+   * Every deployment on this instance, newest-first, with its application attached — the whole
+   * history the pin rule reads ({@code RollbackPins}). Unscoped on purpose: a pin is per application
+   * name across all environments, and the fetch join is what keeps that one query rather than one
+   * per row.
+   */
+  public List<CdDeployment> listAllNewestFirst() {
+    return list(
+        "select d from CdDeployment d join fetch d.application order by d.createdAt desc, d.id desc");
+  }
+
   /** The application's currently serving deployment(s) — by invariant at most one. */
   public List<CdDeployment> listActiveByApplication(String applicationId) {
     return list("application.id = ?1 and status = ?2", applicationId, CdDeploymentStatus.ACTIVE);

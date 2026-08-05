@@ -74,4 +74,12 @@ class MachineGuardEnforcedTest {
     // answers a caller with no bearer at all.
     given().when().get("/cd/api/environments").then().statusCode(200);
   }
+
+  @Test
+  void thePinListingStaysOpenToTheGarbageCollectorThatReadsIt() {
+    // Same rule from the machine side: the pins are a read, so they carry no guard. qits-artifacts
+    // plans its OCI sweep fail-closed on this answer — a 401 here would abort every sweep, and the
+    // gate flipping on must not be the thing that does it.
+    given().when().get("/cd/api/pins").then().statusCode(200);
+  }
 }
