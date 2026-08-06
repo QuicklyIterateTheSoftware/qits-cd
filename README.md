@@ -38,6 +38,7 @@ effect:
 deployment_target: environment   # default when the key or the file is absent | singleton
 available_on_env: false          # default; true = public node (bundle + hub joins)
 branch: main                     # singleton only: the branch that deploys it (default main)
+health_path: /q/health/ready     # exception only; default /<name without qits->/q/health/ready
 ```
 
 Read with `GET <qits.cd.git-host-url>/git/<repoId>/blob/<sha>/.config/qits/deployments.yml` — the
@@ -46,9 +47,9 @@ means every default, so every repository without one behaves exactly as it did b
 existed. Any other failure — the git host down, a 500, a file that does not parse — **fails the
 deployment** with the cause in its `detail`. cd never guesses a topology, because a guess puts a
 container on the wrong networks under the wrong name. The parser is strict for the same reason: an
-unknown key, a repeated key, a value outside the enum and a public singleton (`available_on_env`
-with `singleton` — it already runs on every environment's networks) are all errors naming the file
-and the line.
+unknown key, a repeated key, a value outside the enum, a `health_path` that is not an absolute path
+and a public singleton (`available_on_env` with `singleton` — it already runs on every
+environment's networks) are all errors naming the file and the line.
 
 - `deployment_target: environment` — the service is linked into **every environment whose branch
   matches the build's**, named after the repository. The upsert sends the union of the links the
@@ -66,6 +67,13 @@ and the line.
   `FAILED` row naming the flip, because there is no one environment to inherit its history and the
   environment deployment would remove the running singleton on its way in. Retiring a singleton is
   deliberate.
+- `health_path` — where the health gate curls inside the container. **Registration derives it**:
+  the repository name without its `qits-` prefix, as the first path segment — qits-observability
+  gets `/observability/q/health/ready` — and that derived value is written to the registry like
+  every other derived fact, so a fresh registry needs no hand intervention. The key is for the
+  exceptions: qits-gateway owns the root path space and names `/q/health/ready`. Resolution order,
+  on both planes: the file's value, then the value the registry already holds (an operator's fix
+  survives a later build), then the convention.
 - No environment listens to the branch and it is not a matching singleton ⇒ 202 and nothing, which
   is the normal case for most pushes.
 
@@ -238,9 +246,10 @@ be minted is the same outcome as a registry that cannot be reached, and says so 
 - **The health gate runs inside the container** (`--health-cmd` curl'ing
   `http://localhost:8080<path>`, polled via `docker inspect`): cd never joins an environment's
   network, so the probe has to live where the network is. The image contract that buys: the image
-  carries `curl` and listens on 8080 — both platform conventions. The default path is
-  `/q/health/ready`; an application can name its own (`healthPath` per application — the platform's
-  own services would name `/<segment>/q/health/ready`).
+  carries `curl` and listens on 8080 — both platform conventions. The path comes from the service's
+  registry row, which registration fills with the convention `/<name without qits->/q/health/ready`
+  or with the repository's own `health_path`. `qits.cd.default-health-path` (`/q/health/ready`) is
+  the last resort, for a row an older cd left empty.
 - **Application run arguments come from deployment config, never from the API.**
   `qits.cd.run-args.<application-name>` holds extra `docker run` arguments for that application —
   volumes, env, published ports, even a docker socket mount — whitespace-split and appended

@@ -149,7 +149,7 @@ except a singleton.
 
 **Application rows are derived and there is no write for them.** A green build sends cd to the
 repository's `.config/qits/deployments.yml` at that sha (`CdSpecSource`), and the row is created or
-brought up to date from it. Three consequences worth holding on to:
+brought up to date from it. The consequences worth holding on to:
 
 - A repository with **no file** gets every default, so it behaves exactly as it did before the file
   existed. That is not politeness — it is what let this change deploy onto a platform where no
@@ -170,6 +170,13 @@ brought up to date from it. Three consequences worth holding on to:
   inherits the history, and the environment deployment would find the running singleton through the
   legacy network and remove it, leaving a row that says `ACTIVE` about nothing. Going back is an
   operator's deliberate act, not a build's.
+- **The health path is derived too**, and the derivation is a convention rather than a config
+  default: `/<repository name minus the qits- prefix>/q/health/ready`, written to the registry row.
+  Registration resolves it as spec `health_path` → the row's existing value → the convention, so a
+  repository states an exception (qits-gateway: `/q/health/ready`) and an operator's PUT survives
+  the next build. `qits.cd.default-health-path` is now only the deploy-time last resort for rows an
+  older cd wrote null. This closed a real outage shape: null rows sent every prefixed service's
+  gate to a URL that 404s while the container was fine.
 
 The two planes are the whole of `CdDeploymentTarget`. A **singleton** has no environment (null
 column, no `qits.cd.environment` label, no `QITS_ENVIRONMENT`, `deployment.environment.name=platform`),
@@ -244,6 +251,8 @@ boundary regardless of who the caller is believed to be. `CdIdentifiers` holds a
 - **The health path** is the one value interpolated into a string a shell runs (the container's
   own `--health-cmd`), so it gets the strictest allowlist and is re-checked at the last line
   before the argv (`DockerDeploymentDriver.buildArgv`). Never widen it, never add an exception.
+  `health_path` in `deployments.yml` is a third caller of the same check, for the same reason —
+  the file is repository-authored input.
 
 Argvs are assembled for `ProcessBuilder`, which never re-splits — but do not lean on that:
 validation stays at the boundary and the belt stays at the argv.
