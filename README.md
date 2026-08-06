@@ -1,7 +1,8 @@
 # qits-cd
 
-Continuous deployment for the platform's own services: environments, health-gated cutover, and the
-convention that turns a green build into a running container.
+Continuous deployment for the platform's own services: health-gated cutover and the convention that
+turns a green build into a running container. The environment/application topology it deploys into
+belongs to [qits-serviceregistry](#the-service-registry); cd is its agent on the docker host.
 
 ## What it does
 
@@ -9,23 +10,25 @@ An **environment** is a **tier** — dev, preprod, prod: a name, the branch whos
 into it, and the docker network its public nodes share. Tiers are created deliberately; what they
 hold is not. The lifecycle, end to end:
 
-1. Someone creates the tier — `POST /cd/api/environments` with a name. Conventions fill the rest:
-   the branch is `environment/<name>`, the bundle network is `qits-env-<name>`. No applications are
-   named; there is no write for them.
+1. Someone creates the tier — `POST /cd/api/environments` with a name. cd fills the conventions in
+   (the branch is `environment/<name>`, the bundle network is `qits-env-<name>`), records it in
+   qits-serviceregistry and makes the network. No applications are named; there is no write for
+   them.
 2. Pushes to `environment/<name>` reach the git host, qits-ci builds them, and on a green run
    notifies this service — `POST /cd/api/events/build-succeeded` with
    `{runId, repoId, branch, commitSha}`.
 3. cd reads the repository's own `.config/qits/deployments.yml` at that sha from the git host, and
-   **derives the registration** from it (see below): the application row is created or brought up
-   to date in every place the spec addresses. For each it records a deployment — carrying `runId`
+   **derives the registration** from it (see below): the service is created or brought up to date
+   in the registry, linked into every environment the spec addresses. For each it records a
+   deployment — carrying `runId`
    verbatim, the row's one pointer back at the build that caused it (`/ci/runs/<runId>`); cd
    resolves it against nothing and it is null on every row recorded before the column existed — and,
    on its worker: derives the image reference by convention (`<registry>/qits/<application>:<sha>`),
    pulls it, starts it on its own network with a docker-native health gate, joins it to everything
    else it belongs on, and — only once the fresh container reports healthy — decommissions the
    container it replaces.
-4. Tier retired, someone deletes the environment: rows, containers, its bundle and every network
-   derived from it.
+4. Tier retired, someone deletes the environment: cd's deployment rows, the containers, the bundle
+   and every network derived from it — and last of all the tier itself in the registry.
 
 **Registration is derived, and that file is the whole of it.** Nothing declares an application over
 the API — a repository states how it is deployed and a green build is what makes the statement take
@@ -47,14 +50,17 @@ unknown key, a repeated key, a value outside the enum and a public singleton (`a
 with `singleton` — it already runs on every environment's networks) are all errors naming the file
 and the line.
 
-- `deployment_target: environment` — the row is ensured in **every environment whose branch matches
-  the build's**, named after the repository.
+- `deployment_target: environment` — the service is linked into **every environment whose branch
+  matches the build's**, named after the repository. The upsert sends the union of the links the
+  registry already holds and the ones this branch addresses: `PUT services/{name}` replaces the
+  whole set, so a build on one tier's branch must never unlink another tier.
 - `deployment_target: singleton` — one instance for the whole platform, deployed from its own
-  branch. Registering as one **converts** whatever environment-scoped rows the repository had: their
-  deployment history moves onto the singleton, the active ones decommissioned, and the old rows go.
-  qits-idp is today's only deployed singleton — an identity provider each tier mints its own tokens
-  from would be a different platform; the planned qits-serviceregistry joins it when that leg
-  lands. cd is not one: it is an ordinary environment application, so
+  branch, and with **no links at all** — implicitly linked everywhere, which is what makes a new
+  environment pick it up. Registering as one **converts** whatever the repository had: the service's
+  links go, and its deployment history moves onto the platform plane (the environment cleared off
+  each row, the active ones decommissioned) rather than being deleted, which is what keeps an
+  in-flight self-update row alive across cd's own conversion. qits-idp and qits-serviceregistry are
+  the deployed singletons. cd is not one: it is an ordinary environment application, so
   every tier runs its own deployer, deployed from that tier's branch (today the only tier is dev).
   The conversion is one-way: a singleton whose file goes back to `environment` is refused with a
   `FAILED` row naming the flip, because there is no one environment to inherit its history and the
@@ -98,6 +104,68 @@ row whose container is itself (ACTIVE, prior rows decommissioned), and a rolled-
 predecessor's sweep marks it FAILED as any interrupted row. There is no old↔new channel — the
 H2 lock is the mutex, the deployment row is the shared state, and docker is the lifecycle;
 neither instance referees its own succession.
+
+## The service registry
+
+**qits-serviceregistry is the system of record** for environments and services; cd is its **agent
+door**. The split is the shape of the platform rather than a layering choice: the topology is one
+answer for every tier, so it belongs to one socketless service — while executing a deployment needs
+a docker socket, and the number of processes holding one must not grow.
+
+What that means concretely:
+
+- cd's environment endpoints **stay** and **proxy**. Create → registry create, then `ensureNetwork`
+  (best-effort, as before). PATCH → proxy. DELETE → the label-driven docker teardown **first**, with
+  the legacy-network guard intact, then the registry delete — a teardown needs nothing from the
+  registry, and deleting the tier first would leave a failed teardown with no row to retry it from.
+  Reads proxy through. The request and response shapes did not change, which is why the bootstrap
+  and qits-spa-cd needed no release beside this one.
+- **Derived registration writes there**, and deploy resolution reads there (branch match, links, the
+  singleton set).
+- **cd's own domain is the deployment rows.** They name their application and their tier as plain
+  strings, no FK — the `ci_run.repo_id` stance, applied across a service boundary. The ids the read
+  surface reports (`CdApplicationDto.id`, `CdDeploymentDto.applicationId`) are **derived** from
+  `<environmentId>:<name>`, so a client can still join the two listings; there is no application row
+  left to take an id from.
+- **The client speaks HTTP and nothing else.** `RegistryClient` is a port in `cd/control`; the
+  `java.net.http` implementation is in `service/registry`. The two repositories share no code, and
+  the suites stand a real stub server on the wire contract (`StubRegistry`) — the `StubGitHost`
+  arrangement.
+
+### What an outage does, and how far it reaches
+
+| when | what happens |
+|---|---|
+| a build arrives | `FAILED` deployment rows naming the cause, in every tier this application is known to have deployed into — the posture an unreadable spec already has. Nothing is pulled or started on a guess. A repository with no history gets nothing: 202 and silence, as an unknown repository always has |
+| an environment endpoint is called | 502, never an empty list — a caller reading "no environments" would take it for a platform with none |
+| `GET /cd/api/pins` | **unaffected.** It reads deployment rows only, and qits-artifacts' image GC is fail-closed on it: a registry outage must not stop garbage collection across the platform |
+| the process starts | **unaffected.** Nothing at boot requires the registry. The in-flight sweep reads only cd's own columns; the export below declines and logs a WARN |
+
+### The one-time export
+
+At startup (skipped in test mode, the `DeployService.onStart` arrangement), cd exports its own
+`cd_environment`/`cd_application` rows into the registry — but only when **all three** hold: the
+registry answers, it holds **zero** environments, and there are local rows to send. An empty registry
+is the only safe signal that nothing has been exported yet; a registry someone has edited since must
+never be overwritten by a stale copy of tables cd stopped maintaining. An application that existed in
+two tiers becomes **one service with two links**. Failures are logged at WARN and never fatal: a
+registry that is down at boot is retried at the next start.
+
+`cd_environment` and `cd_application` are **frozen** from that moment: nothing reads or writes them
+except the export. They are deliberately not dropped in this release — a drop is the irreversible
+half of the change, and it belongs in its own cleanup migration once the rollout has proven the
+export.
+
+### The credential
+
+The registry guards its writes (`aud=qits-serviceregistry`) and the live platform runs its gate on,
+so cd presents a bearer minted by qits-idp against its own client credentials — `registry/RegistryBearer`,
+which is qits-ci's `CdBearer` pointed the other way. One switch,
+`quarkus.oidc-client.client-enabled`, shipped **false**: off, the extension builds a disabled client,
+the process needs no secret, dials nothing at boot, and calls the registry bare. A deployment turns
+it on with `QUARKUS_OIDC_CLIENT_CLIENT_ENABLED=true` and
+`QUARKUS_OIDC_CLIENT_CREDENTIALS_SECRET=<the secret qits-idp holds for qits-cd>`. A token that cannot
+be minted is the same outcome as a registry that cannot be reached, and says so on the row.
 
 ## The conventions this service is made of
 
@@ -225,9 +293,9 @@ segment is the client's.
 |---|---|---|
 | `/cd/` | GET | the Angular SPA, built from `service/src/main/webui` by Quinoa and served by this process (`quarkus.quinoa.ui-root-path`); unmatched paths under it fall back to `index.html`, so the client's own router gets its deep links — except under the prefixes below |
 | `/cd` | GET, HEAD | a 301 to `/cd/`. Quinoa mounts at `/cd/*`, which does not match the bare segment (upstream quinoa #960); `webui/WebUiRedirect` is this service's answer |
-| `/cd/api/environments` | GET, POST | list; create a tier (a name is enough — `applications` is optional and deprecated) |
-| `/cd/api/environments/{id}` | GET, PATCH, DELETE | one environment with its applications; rename or retarget it (`{name?, branch?}`, no docker side effects); teardown |
-| `/cd/api/applications` | GET | every application cd deploys — the environments' and the platform's singletons, flat, each saying which plane it is on |
+| `/cd/api/environments` | GET, POST | list; create a tier (a name is enough — `applications` is accepted and ignored). Proxied to qits-serviceregistry; 502 when it cannot be reached |
+| `/cd/api/environments/{id}` | GET, PATCH, DELETE | one environment with its applications; rename or retarget it (`{name?, branch?}`, no docker side effects); teardown (docker first, then the tier in the registry) |
+| `/cd/api/applications` | GET | every application cd deploys — the environments' and the platform's singletons, flat, each saying which plane it is on. Proxied |
 | `/cd/api/deployments?environmentId=` | GET | an environment's deployments, newest-first |
 | `/cd/api/pins` | GET | the image shas deployments pin, across every environment: what serves and what a rollback restores. Read by qits-artifacts' image GC, which keeps what this names and aborts its sweep when cd cannot answer |
 | `/cd/api/events/build-succeeded` | POST | the qits-ci intake (hidden from the OpenAPI document) |
@@ -301,9 +369,12 @@ does this, for the same reason.
 
 ## What is deliberately not here
 
-- **Staying the platform's registry.** The environment and application registry that lives here
-  today is planned to extract into a new `qits-serviceregistry` service — a singleton of its own —
-  in a later leg.
+- **Owning environments and applications.** They are qits-serviceregistry's since the extraction;
+  this service keeps the deployment rows and the docker socket. See
+  [The service registry](#the-service-registry).
+- **Dropping the frozen tables.** `cd_environment` and `cd_application` survive this release,
+  read by nothing but the one-time export. The cleanup migration that drops them is a later,
+  deliberate change.
 - **Building or publishing images.** cd consumes the OCI registry; producing for it is the
   publisher's story. A green build with no image is `IMAGE_MISSING`, loudly.
 - **DNS wiring.** qits-dns's plan names cd as the caller that will wire

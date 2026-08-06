@@ -7,9 +7,10 @@ the conventions. This file is the working conventions on top of it.
 
 **A clone of this repo alone builds and tests green** — no monorepo, no docker, no prior
 `mvn install` elsewhere, no credentials, **no network**. That is why the poms duplicate versions
-instead of inheriting them, and why both seams that reach outside the process are faked rather than
-skipped: `FakeDeploymentDriver` behind `DeploymentDriver` (docker) and `FakeSpecSource` behind
-`CdSpecSource` (the git host).
+instead of inheriting them, and why every seam that reaches outside the process is faked or stubbed
+rather than skipped: `FakeDeploymentDriver` behind `DeploymentDriver` (docker), `FakeSpecSource`
+behind `CdSpecSource` (the git host), and `StubRegistry` on a loopback socket for
+`RegistryClient` (qits-serviceregistry).
 
 **Which command is the gate depends on whether you have the client**, and this is worth getting
 right because the clone rule now has two halves (`git clone … && git submodule update --init`):
@@ -49,18 +50,20 @@ package:
   fields; mappers are MapStruct `@Mapper(componentModel = "jakarta")`. `control` owns the two
   orchestrators (`EnvironmentService`, `DeployService`), the validation (`CdIdentifiers`), the
   shell-out (`CdProcess`), the image-reference and network-name conventions (`ImageRefs`,
-  `CdNetworks`), the strict spec parser (`DeploymentSpecParser`) and the two seams
-  (`DeploymentDriver`, `CdSpecSource`).
+  `CdNetworks`), the derived application id (`CdApplicationKeys`), the strict spec parser
+  (`DeploymentSpecParser`), the one-time export (`RegistryExport`) and the three seams
+  (`DeploymentDriver`, `CdSpecSource`, `RegistryClient`).
 - `service/` — `api` (the JAX-RS routes and `CdExceptionMapper`), `dockerhost`
   (`DockerDeploymentDriver` — the sole implementation of the docker seam, kept here because it is
-  cd's whole relationship with the host's docker daemon) and `githost` (`GitHostSpecSource`, the
-  one outbound HTTP call). There is no `security` package any more: the forward-auth pair moved to
-  the published `qits-auth-core` library.
+  cd's whole relationship with the host's docker daemon), `githost` (`GitHostSpecSource`) and
+  `registry` (`HttpRegistryClient` and `RegistryBearer`, the calls onto qits-serviceregistry).
+  There is no `security` package any more: the forward-auth pair moved to the published
+  `qits-auth-core` library.
 
-**The seam rule is one rule, applied twice.** Both things `cd/` cannot do — shell out to docker,
-fetch a file over HTTP — are interfaces there and implementations in `service/`, with a scripted
-fake in the suite. Anything that grows a third of these follows the same shape; do not put a client
-in the domain module.
+**The seam rule is one rule, applied three times.** Everything `cd/` cannot do — shell out to
+docker, fetch a file over HTTP, call qits-serviceregistry — is an interface there and an
+implementation in `service/`, with a scripted fake or a stub server in the suite. Anything that
+grows a fourth follows the same shape; do not put a client in the domain module.
 
 One package sits outside that tree: `eu.wohlben.qits.webui`, holding `WebUiRedirect` and only that.
 It keeps the sibling services' spelling rather than taking a `cd`-flavoured one, so the file is
@@ -100,6 +103,43 @@ The startup sweep (`DeployService.onStart`) fails rows left `QUEUED`/`STARTING` 
 was ACTIVE before the restart is still serving. Do not "complete" the sweep with a reap; the
 asymmetry with qits-ci (whose step containers are ephemeral by definition) is the point.
 
+## The registry is the system of record; cd is the agent door
+
+Environments and services live in **qits-serviceregistry** since the extraction. cd keeps the
+deployment rows, the docker socket and the surfaces — its environment endpoints proxy, and a create
+also makes a network while a delete also reaps containers, which is why they stayed here.
+
+Working rules that follow from it, and each has already cost something:
+
+- **`RegistryClient` is a port in `cd/control`; the `java.net.http` implementation is in
+  `service/registry`.** Same rule as `DeploymentDriver` and `CdSpecSource`, applied a third time —
+  no HTTP client in the domain module. The suites stand a real server on the wire contract
+  (`registry/StubRegistry`, the `StubGitHost` arrangement); the two repositories share no code, so
+  the contract is the interface and a mismatch is a failing read here.
+- **`PUT services/{name}` replaces the whole link set.** So derived registration sends the UNION of
+  what the registry already holds and what this branch addresses. Sending only this build's tier
+  silently unlinks every other one, and nothing would report it.
+- **DELETE order: docker first, registry last.** The teardown is label-driven and needs nothing from
+  the registry; deleting the tier first would leave a failed teardown with no row to retry it from.
+  `CdEnvironmentApiTest.theDockerTeardownRunsBeforeTheRegistryDelete` holds it.
+- **Nothing at boot may require the registry.** The sweep reads only cd's own columns and
+  `RegistryExport` declines with a WARN. cd is the thing that would have to redeploy the registry, so
+  a registry outage must never be a cd outage.
+- **`GET /cd/api/pins` must stay registry-free.** qits-artifacts' image GC is fail-closed on it, so a
+  pin that needed the registry would stop garbage collection platform-wide during an outage.
+  Everything the rule reads is on the deployment row.
+- **Registry unreachable or erroring at deploy time ⇒ `FAILED` rows with the cause**, in the tiers
+  this application's own rows say it deploys into; no rows to fail ⇒ 202 and silence. Exactly the
+  posture a failed spec read has. Never guess a topology from either.
+- **`cd_environment` / `cd_application` are FROZEN**, read only by the one-time export. Do not add a
+  reader. Dropping them is a later cleanup migration, deliberately not this release's.
+- **The ids on the read surface are derived** (`CdApplicationKeys`, `<environmentId>:<name>`), because
+  the client joins the applications listing against `CdDeploymentDto.applicationId` and there is no
+  application row left to take an id from. Both sides must keep using that one definition.
+- **The registry's writes are machine-guarded.** `registry/RegistryBearer` mints the bearer, behind
+  the single shipped-off switch `quarkus.oidc-client.client-enabled` — qits-ci's `CdBearer`, pointed
+  the other way. A token that cannot be minted takes the registry-unreachable path.
+
 ## The model: tiers, derived rows, and two planes
 
 An **environment is a tier** (dev, preprod, prod), created deliberately over REST, branch
@@ -118,12 +158,12 @@ brought up to date from it. Three consequences worth holding on to:
 - A spec that cannot be **read or parsed** fails the deployment with the cause on the row. Never add
   a fallback that guesses: a guessed topology is a container on the wrong networks under the wrong
   name, which is worse than a recorded failure and much harder to see.
-- `deployment_target: singleton` **converts** the repository's environment-scoped rows — their
-  deployments move onto the singleton, the active ones decommissioned, the old rows go. That
-  conversion is a one-time live migration (qits-idp, today's only deployed singleton; the planned
-  qits-serviceregistry joins it later — cd is an ordinary environment application) and the reason it
-  moves rather than deletes is `sweepInFlight`: a `STARTING` self-update row must survive a
-  converting deployment.
+- `deployment_target: singleton` **converts** the repository's environment links — they go, and its
+  deployment rows move onto the platform plane (their `environment_id` cleared, the active ones
+  decommissioned). That conversion is a one-time live migration (qits-idp and qits-serviceregistry
+  are the deployed singletons — cd is an ordinary environment application) and the reason it moves
+  rather than deletes is `sweepInFlight`: a `STARTING` self-update row must survive a converting
+  deployment.
 - **The conversion runs one way only.** A repository that is already a singleton and whose spec goes
   back to `environment` is REFUSED, with a `FAILED` row on the singleton naming the flip and an
   ERROR log — not converted. There is no answer to which of the environments tracking the branch
@@ -292,14 +332,25 @@ wrong place, and no server-side test can see it.
 
 Don't. This context has no compile-time dependency on any other qits module and should not grow
 one. Things arrive as an HTTP payload on the intake, or as a URL in config, or not at all. Never
-add a JPA relation to another context's entity — `cd_application.repo_id` is a plain `String`
-column in cd's **own** physical database; the FKs inside that database (application → environment,
-deployment → application) are fine and are not what the rule is about.
+add a JPA relation to another context's entity. Since the extraction the rule reaches inside this
+schema too: `cd_deployment` names its application and its tier as plain `String` columns with **no
+FK**, because what they name lives in qits-serviceregistry's database. That is what keeps the
+deployment history — and the pins read off it — answering while the registry is down.
 
 ## Schema changes
 
 `cd/src/main/resources/db/cd/migration/`, hand-written, its own lineage on its own datasource —
 keep appending, never edit an applied migration.
+
+The suites run every migration against an **empty** schema, so a backfill is untested by them.
+`cd/src/test/.../CdV5MigrationTest` is the shape to copy: plain JUnit, a real H2, Flyway to the
+version before, the rows the old code wrote, then the rest of the way. V5's backfill and the startup
+sweep's adoption of a `STARTING` row written by cd v1 are held there.
+
+Deployment listings order by `seq`, V5's identity column, and **not** by `createdAt desc, id desc`:
+the id is a random UUID, so the old tiebreak swapped two rows recorded in the same tick at random —
+which is what the deployments of one build-succeeded event are, and what a client reads "the current
+one per application" off.
 
 ## Dependencies
 
@@ -334,6 +385,11 @@ when the platform's Quarkus passes the version a release is built against.
   quarkus-oidc the public half, so the enforced path is exercised end to end with no qits-idp to
   reach. Those PEMs are **test fixtures, not credentials** — nothing outside the suite has ever
   seen them, and no deployment key belongs in this repo.
+- **`StubRegistry` is a `@WithTestResource(scope = GLOBAL)` on every `@QuarkusTest` here**, not a
+  `@Mock`: it stands the wire contract up on a real socket, so the client's paths, bodies and status
+  translation are under test and not just its interface. Its state is static — reset it in
+  `@BeforeEach` beside the fakes — and it can be told to go offline or to answer an error, which is
+  how the outage posture is exercised.
 - `FakeDeploymentDriver` and `FakeSpecSource` are `@Mock` and application-scoped, so they are
   shared across tests: reset both in `@BeforeEach`, use distinct environment names **and repository
   ids** per test, and read their state through their **methods** — the injected reference is a CDI
