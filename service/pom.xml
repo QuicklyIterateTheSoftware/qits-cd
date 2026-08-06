@@ -82,6 +82,15 @@
             <artifactId>quarkus-oidc</artifactId>
         </dependency>
         <dependency>
+            <!-- The other direction: qits-cd ASKS qits-idp for a token, to present to
+                 qits-serviceregistry, whose writes are machine-guarded (registry/RegistryBearer).
+                 Off by default — quarkus.oidc-client.client-enabled=false in application.properties
+                 — so the extension builds a disabled client, boots without a secret and never dials
+                 anything. Same shape and same switch as qits-ci's CdBearer. -->
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-oidc-client</artifactId>
+        </dependency>
+        <dependency>
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-rest-jackson</artifactId>
         </dependency>
