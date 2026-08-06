@@ -54,11 +54,11 @@ public interface DeploymentDriver {
   /**
    * Best-effort ensure the network exists, labelled — warn, never fail, when docker is absent.
    *
-   * <p>Returns whether this call <b>created</b> it. That answer drives the reconciliation: a
-   * freshly made per-application network has nobody on it yet, so the environment's public nodes
-   * and every singleton have to be joined to it before anything can reach the application. An
-   * already-existing network keeps whatever labels it has — adopting an unlabelled network made
-   * outside cd (the platform's own {@code qits-net}) stays supported, deliberately.
+   * <p>Returns whether this call <b>created</b> it. The reconciliation deliberately does not hang
+   * off that answer — a network outlives the deployment that made it, so who belongs on it is
+   * recomputed every time rather than joined once. An already-existing network keeps whatever
+   * labels it has: adopting an unlabelled network made outside cd (the platform's own {@code
+   * qits-net}) stays supported, deliberately.
    */
   boolean ensureNetwork(Network spec);
 

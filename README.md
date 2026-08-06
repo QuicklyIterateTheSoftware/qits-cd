@@ -137,9 +137,10 @@ neither instance referees its own succession.
   Containers carry `qits.cd.environment` (absent on singletons, so an environment teardown cannot
   take one with it), `qits.cd.application`, `qits.cd.deployment`, `qits.cd.target` and
   `qits.cd.available-on-env`, plus `qits.cd.app-name` so a reconciliation can join a running
-  container under the right alias. When a deploy **creates** a per-application network it joins that
-  environment's public nodes and every singleton to it — the network did not exist a moment ago, so
-  nobody is on it.
+  container under the right alias. Every deploy joins that environment's public nodes and every
+  singleton to the application's network — a fresh network has nobody on it, and one that outlived
+  a deployment that failed to start has nobody on it either, so the set is recomputed rather than
+  joined once.
 - **The network alias is the application name** and stays stable across deployments while
   container names (`qits-cd-<env>-<app>-<deployment-prefix>`, or `qits-cd-singleton-<app>-<prefix>`)
   do not. Peers address each other by application name, exactly as the platform's compose files do.

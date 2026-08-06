@@ -467,12 +467,9 @@ public class DeployService {
             });
 
     // Networks are re-ensured on every deployment rather than trusted from creation time — an
-    // environment created while docker was down must heal, not stay broken. Whether the primary
-    // one was CREATED here is the reconciliation trigger: a network that did not exist a moment
-    // ago has nobody on it, so the environment's public nodes and every singleton have to be
-    // joined to it or this application is unreachable from both.
+    // environment created while docker was down must heal, not stay broken.
     String primaryNetwork = plan.primaryNetwork();
-    boolean primaryIsNew = driver.ensureNetwork(primaryNetworkSpec(plan));
+    driver.ensureNetwork(primaryNetworkSpec(plan));
     if (!plan.singleton() && plan.availableOnEnv()) {
       driver.ensureNetwork(
           new DeploymentDriver.Network(
@@ -521,7 +518,7 @@ public class DeployService {
         return;
       }
       join(containerName, plan.applicationName(), joins);
-      reconcile(plan, primaryNetwork, primaryIsNew);
+      reconcile(plan, primaryNetwork);
       driver.handoff(
           new DeploymentDriver.HandoffSpec(
               imageRef, selfHolder.id(), containerName, healthTimeoutSeconds));
@@ -547,7 +544,7 @@ public class DeployService {
     // membership lost to a manual `network disconnect` or to a network that did not exist last
     // time is simply back on the replacement.
     join(containerName, plan.applicationName(), joins);
-    reconcile(plan, primaryNetwork, primaryIsNew);
+    reconcile(plan, primaryNetwork);
 
     DeploymentDriver.HealthResult health =
         driver.awaitHealthy(containerName, Duration.ofSeconds(healthTimeoutSeconds));
@@ -667,12 +664,19 @@ public class DeployService {
   }
 
   /**
-   * A per-application network that did not exist a moment ago has nobody on it. Join the
-   * environment's public nodes and every singleton, both found by their container labels — docker
-   * is the membership bookkeeping, so this asks the runtime rather than a table.
+   * Put the environment's public nodes and every singleton on this application's network, both
+   * found by their container labels — docker is the membership bookkeeping, so this asks the
+   * runtime rather than a table.
+   *
+   * <p>It runs on <b>every</b> deployment, not only on the one that made the network, for the same
+   * reason the container's own joins are recomputed: the network outlives the deployment that
+   * created it. A deployment that made the network and then failed to start leaves it behind with
+   * nobody on it, and the application would stay unreachable from the gateway and from every
+   * singleton until some hub happened to redeploy. Joining is idempotent — docker refuses an
+   * already-joined container and changes nothing — so recomputing it is the self-heal.
    */
-  private void reconcile(Plan plan, String primaryNetwork, boolean primaryIsNew) {
-    if (!primaryIsNew || plan.singleton()) {
+  private void reconcile(Plan plan, String primaryNetwork) {
+    if (plan.singleton()) {
       return;
     }
     for (DeploymentDriver.Endpoint hub : driver.hubContainers(plan.environmentId())) {

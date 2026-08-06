@@ -486,6 +486,32 @@ public class CdDeploymentFlowTest {
   }
 
   @Test
+  public void anApplicationNetworkThatOutlivedAFailedDeployIsStillReconciled() {
+    // The network is made before the container starts, so a deployment that failed to start leaves
+    // it behind with nobody on it. The next deploy does NOT create it, and if that were the
+    // reconciliation's trigger the application would stay unreachable from the gateway and from
+    // every singleton for as long as no hub happened to redeploy.
+    String environmentId = createEnvironment("flow-reheal", "repo-reheal-seed", "app-reheal-seed");
+    driver.scriptExistingNetwork(
+        new DeploymentDriver.Network(
+            "qits-env-flow-reheal-repo-reheal",
+            environmentId,
+            DeploymentDriver.NetworkKind.APPLICATION,
+            "repo-reheal"));
+    driver.scriptHubContainers(List.of(new DeploymentDriver.Endpoint("hub-id", "qits-gateway")));
+    driver.scriptSingletonContainers(List.of(new DeploymentDriver.Endpoint("cd-id", "qits-cd")));
+    postBuildSucceeded("repo-reheal", "environment/flow-reheal", SHA_A);
+
+    awaitDeployments(environmentId, 1);
+    assertTrue(
+        driver.connections().contains("qits-env-flow-reheal-repo-reheal:hub-id:qits-gateway"),
+        "the hub is put back on a network it should already be on: " + driver.connections());
+    assertTrue(
+        driver.connections().contains("qits-env-flow-reheal-repo-reheal:cd-id:qits-cd"),
+        "and so is every singleton: " + driver.connections());
+  }
+
+  @Test
   public void thePredecessorSearchCoversTheLegacyNetworkTooDuringTheMigration() {
     // The union IS the migration: today's containers hold their alias on qits-net and on no
     // per-application network at all, so a search of the new networks alone would start a second
