@@ -18,9 +18,13 @@ import org.jboss.logging.Logger;
  * The sole production implementation of {@link DeploymentDriver}: shells the docker CLI via {@link
  * CdProcess} ({@code ProcessBuilder}, never a shell — nothing is ever re-split). cd's whole docker
  * vocabulary is here: {@code pull}, {@code run}, {@code inspect}, {@code logs}, {@code rm}, {@code
- * ps}, {@code network} create/inspect/rm. {@code exec} is not in it and must not enter it — what a
- * deployed container runs is its image's own entrypoint, and cd's relationship with it ends at
- * lifecycle.
+ * ps}, {@code network} create/inspect/ls/connect/disconnect/rm. {@code exec} is not in it and must
+ * not enter it — what a deployed container runs is its image's own entrypoint, and cd's
+ * relationship with it ends at lifecycle.
+ *
+ * <p><b>Labels are the membership bookkeeping.</b> Which containers sit on which networks is never
+ * stored in cd's database; it is written as docker labels at {@code run}/{@code network create} and
+ * read back with {@code --filter label=}. One record of the truth, and it is the runtime's.
  *
  * <p><b>The health gate runs inside the container, on purpose.</b> cd never joins an environment's
  * network, so it cannot probe the fresh container itself; instead the {@code docker run} carries a
@@ -49,11 +53,15 @@ public class DockerDeploymentDriver implements DeploymentDriver {
   /** Lines of container log kept as a failed gate's diagnosis. */
   private static final String LOG_TAIL_LINES = "200";
 
-  /** The label every container cd starts carries — the teardown finds them by it. */
-  static final String ENVIRONMENT_LABEL = "qits.cd.environment";
+  /**
+   * The name a container carries its application by. Not in the pinned label set, and here because
+   * a reconciliation joins a <i>running</i> container to a network and has to give it the right
+   * alias there — the application id it already carried names the row, not the address peers use.
+   */
+  static final String APP_NAME_LABEL = DeploymentDriver.APP_NAME_LABEL;
 
-  static final String APPLICATION_LABEL = "qits.cd.application";
-  static final String DEPLOYMENT_LABEL = "qits.cd.deployment";
+  /** What {@code deployment.environment.name} says for a container that is in every environment. */
+  static final String SINGLETON_ENVIRONMENT = "platform";
 
   /**
    * What docker says when the registry answered "no such image". Matched case-insensitively over
@@ -105,17 +113,196 @@ public class DockerDeploymentDriver implements DeploymentDriver {
   String dockerSocketPath;
 
   @Override
-  public void ensureNetwork(String network) {
-    if (CdProcess.run(null, List.of(runtime, "network", "inspect", network), CLEANUP_TIMEOUT, 8192)
+  public boolean ensureNetwork(Network spec) {
+    if (CdProcess.run(
+                null,
+                List.of(runtime, "network", "inspect", spec.name()),
+                CLEANUP_TIMEOUT,
+                8192)
             .exitCode()
         == 0) {
-      return;
+      // Already there, labels and all — including a network made outside cd. Adopting the
+      // platform's own qits-net rather than insisting on labelling it is deliberate: the labels
+      // are how cd FINDS the networks it made, not a claim of ownership over every network.
+      return false;
     }
     CdProcess.Result create =
-        CdProcess.run(null, List.of(runtime, "network", "create", network), CLEANUP_TIMEOUT, 8192);
+        CdProcess.run(null, buildNetworkCreateArgv(spec), CLEANUP_TIMEOUT, 8192);
     if (create.exitCode() != 0) {
-      LOG.warnf("Could not ensure network '%s': %s", network, create.output());
+      LOG.warnf("Could not ensure network '%s': %s", spec.name(), create.output());
+      return false;
     }
+    LOG.debugf("Created network %s (%s)", spec.name(), spec.kind());
+    return true;
+  }
+
+  /** Package-private for the argv test: the labels are how every later lookup finds this network. */
+  List<String> buildNetworkCreateArgv(Network spec) {
+    List<String> argv = new ArrayList<>(List.of(runtime, "network", "create"));
+    argv.add("--label");
+    argv.add(NETWORK_LABEL + "=" + spec.kind().name().toLowerCase(Locale.ROOT));
+    if (spec.environmentId() != null) {
+      argv.add("--label");
+      argv.add(ENVIRONMENT_LABEL + "=" + spec.environmentId());
+    }
+    if (spec.applicationName() != null) {
+      argv.add("--label");
+      argv.add(APP_NAME_LABEL + "=" + spec.applicationName());
+    }
+    argv.add(spec.name());
+    return List.copyOf(argv);
+  }
+
+  @Override
+  public List<Network> networks() {
+    CdProcess.Result listed =
+        CdProcess.run(
+            null,
+            List.of(
+                runtime,
+                "network",
+                "ls",
+                "--filter",
+                "label=" + NETWORK_LABEL,
+                "--format",
+                "{{.Name}}|{{.Labels}}"),
+            CLEANUP_TIMEOUT,
+            outputMaxChars);
+    if (listed.exitCode() != 0) {
+      LOG.debugf("Could not list cd's networks: %s", listed.output());
+      return List.of();
+    }
+    return parseNetworks(listed.output());
+  }
+
+  /** Package-private for the parsing test: one {@code name|k=v,k=v} line per network. */
+  static List<Network> parseNetworks(String output) {
+    List<Network> networks = new ArrayList<>();
+    for (String line : (output == null ? "" : output).split("\\R")) {
+      String[] parts = line.trim().split("\\|", 2);
+      if (parts.length < 2 || parts[0].isEmpty()) {
+        continue;
+      }
+      String environmentId = null;
+      String applicationName = null;
+      NetworkKind kind = null;
+      for (String label : parts[1].split(",")) {
+        int equals = label.indexOf('=');
+        if (equals < 0) {
+          continue;
+        }
+        String key = label.substring(0, equals).trim();
+        String value = label.substring(equals + 1).trim();
+        switch (key) {
+          case ENVIRONMENT_LABEL -> environmentId = value;
+          case APP_NAME_LABEL -> applicationName = value;
+          case NETWORK_LABEL -> kind = kind(value);
+          default -> {
+            /* someone else's label */
+          }
+        }
+      }
+      if (kind != null) {
+        networks.add(new Network(parts[0], environmentId, kind, applicationName));
+      }
+    }
+    return List.copyOf(networks);
+  }
+
+  private static NetworkKind kind(String value) {
+    for (NetworkKind candidate : NetworkKind.values()) {
+      if (candidate.name().equalsIgnoreCase(value)) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  @Override
+  public void connect(String network, String container, String alias) {
+    List<String> argv = new ArrayList<>(List.of(runtime, "network", "connect"));
+    if (alias != null && !alias.isBlank()) {
+      argv.add("--alias");
+      argv.add(alias);
+    }
+    argv.add(network);
+    argv.add(container);
+    CdProcess.Result result = CdProcess.run(null, argv, CLEANUP_TIMEOUT, 8192);
+    if (result.exitCode() != 0) {
+      // Already-joined answers non-zero and is the normal outcome of the pre-deploy self-heal.
+      LOG.debugf("Could not join %s to '%s': %s", container, network, result.output());
+    }
+  }
+
+  @Override
+  public void disconnect(String network, String container) {
+    CdProcess.Result result =
+        CdProcess.run(
+            null,
+            List.of(runtime, "network", "disconnect", network, container),
+            CLEANUP_TIMEOUT,
+            8192);
+    if (result.exitCode() != 0) {
+      LOG.debugf("Could not remove %s from '%s': %s", container, network, result.output());
+    }
+  }
+
+  @Override
+  public List<Endpoint> hubContainers(String environmentId) {
+    return endpoints(
+        List.of(
+            "label=" + AVAILABLE_ON_ENV_LABEL + "=true",
+            "label=" + ENVIRONMENT_LABEL + "=" + environmentId));
+  }
+
+  @Override
+  public List<Endpoint> singletonContainers() {
+    return endpoints(List.of("label=" + TARGET_LABEL + "=singleton"));
+  }
+
+  /** Running containers matching every filter, each with the alias it must keep on a new network. */
+  private List<Endpoint> endpoints(List<String> filters) {
+    List<String> argv = new ArrayList<>(List.of(runtime, "ps", "-q"));
+    for (String filter : filters) {
+      argv.add("--filter");
+      argv.add(filter);
+    }
+    CdProcess.Result listed = CdProcess.run(null, argv, CLEANUP_TIMEOUT, 8192);
+    if (listed.exitCode() != 0) {
+      LOG.debugf("Could not list containers %s: %s", filters, listed.output());
+      return List.of();
+    }
+    List<String> ids = idLines(listed.output());
+    if (ids.isEmpty()) {
+      return List.of();
+    }
+    List<String> inspect =
+        new ArrayList<>(
+            List.of(
+                runtime,
+                "inspect",
+                "--format",
+                "{{.Id}}|{{index .Config.Labels \"" + APP_NAME_LABEL + "\"}}"));
+    inspect.addAll(ids);
+    CdProcess.Result inspected = CdProcess.run(null, inspect, CLEANUP_TIMEOUT, outputMaxChars);
+    if (inspected.exitCode() != 0) {
+      LOG.debugf("Could not inspect containers %s: %s", filters, inspected.output());
+      return List.of();
+    }
+    return parseEndpoints(inspected.output());
+  }
+
+  /** Package-private for the parsing test: one {@code id|app-name} line per container. */
+  static List<Endpoint> parseEndpoints(String output) {
+    List<Endpoint> endpoints = new ArrayList<>();
+    for (String line : (output == null ? "" : output).split("\\R")) {
+      String[] parts = line.trim().split("\\|", 2);
+      if (parts.length < 2 || parts[0].isEmpty() || parts[1].isBlank()) {
+        continue;
+      }
+      endpoints.add(new Endpoint(parts[0], parts[1].trim()));
+    }
+    return List.copyOf(endpoints);
   }
 
   @Override
@@ -145,37 +332,52 @@ public class DockerDeploymentDriver implements DeploymentDriver {
   }
 
   @Override
-  public List<Holder> aliasHolders(String network, String alias) {
-    CdProcess.Result listed =
-        CdProcess.run(
-            null,
-            List.of(runtime, "ps", "-q", "--filter", "network=" + network),
-            CLEANUP_TIMEOUT,
-            8192);
+  public List<Holder> aliasHolders(List<String> networks, String alias) {
+    // The UNION over every network the fresh container is about to be on, legacy one included.
+    // A `docker ps --filter network=a --filter network=b` is an OR over networks, so one call
+    // answers the whole question — and a container on two of them appears once.
+    List<String> argv = new ArrayList<>(List.of(runtime, "ps", "-q"));
+    for (String network : networks) {
+      argv.add("--filter");
+      argv.add("network=" + network);
+    }
+    CdProcess.Result listed = CdProcess.run(null, argv, CLEANUP_TIMEOUT, 8192);
     if (listed.exitCode() != 0) {
-      LOG.debugf("Could not list containers on '%s': %s", network, listed.output());
+      LOG.debugf("Could not list containers on %s: %s", networks, listed.output());
       return List.of();
     }
-    List<String> ids =
-        Arrays.stream((listed.output() == null ? "" : listed.output()).split("\\R"))
-            .map(String::trim)
-            .filter(id -> !id.isEmpty())
-            .toList();
+    List<String> ids = idLines(listed.output());
     if (ids.isEmpty()) {
       return List.of();
     }
-    // One inspect for all of them: id|name|the container's aliases on THIS network. A container's
+    // One inspect for all of them: id|name|every alias the container holds anywhere. A container's
     // own name always resolves on a user-defined network, so it counts as an alias here — that is
-    // what lets a replace cutover absorb a predecessor the bootstrap started outside cd.
-    List<String> argv = new ArrayList<>(List.of(runtime, "inspect", "--format",
-        "{{.Id}}|{{.Name}}|{{with (index .NetworkSettings.Networks \"" + network + "\")}}{{range .Aliases}}{{.}} {{end}}{{end}}"));
-    argv.addAll(ids);
-    CdProcess.Result inspected = CdProcess.run(null, argv, CLEANUP_TIMEOUT, outputMaxChars);
+    // what lets a replace cutover absorb a predecessor the bootstrap started outside cd. The
+    // aliases are read across all networks rather than one: the containers were already filtered
+    // to the networks that matter, and a predecessor that holds the alias on the legacy network
+    // alone is exactly the one this has to find.
+    List<String> inspect =
+        new ArrayList<>(
+            List.of(
+                runtime,
+                "inspect",
+                "--format",
+                "{{.Id}}|{{.Name}}|{{range $net, $conf := .NetworkSettings.Networks}}"
+                    + "{{range $conf.Aliases}}{{.}} {{end}}{{end}}"));
+    inspect.addAll(ids);
+    CdProcess.Result inspected = CdProcess.run(null, inspect, CLEANUP_TIMEOUT, outputMaxChars);
     if (inspected.exitCode() != 0) {
-      LOG.debugf("Could not inspect containers on '%s': %s", network, inspected.output());
+      LOG.debugf("Could not inspect containers on %s: %s", networks, inspected.output());
       return List.of();
     }
     return parseHolders(inspected.output(), alias);
+  }
+
+  private static List<String> idLines(String output) {
+    return Arrays.stream((output == null ? "" : output).split("\\R"))
+        .map(String::trim)
+        .filter(id -> !id.isEmpty())
+        .toList();
   }
 
   /** Package-private for the parsing test: one `id|/name|alias alias ...` line per container. */
@@ -375,11 +577,7 @@ public class DockerDeploymentDriver implements DeploymentDriver {
       LOG.debugf("Could not list containers of environment %s: %s", environmentId, listed.output());
       return 0;
     }
-    List<String> ids =
-        Arrays.stream((listed.output() == null ? "" : listed.output()).split("\\R"))
-            .map(String::trim)
-            .filter(id -> !id.isEmpty())
-            .toList();
+    List<String> ids = idLines(listed.output());
     if (ids.isEmpty()) {
       return 0;
     }
@@ -412,8 +610,10 @@ public class DockerDeploymentDriver implements DeploymentDriver {
     argv.add("-d");
     argv.add("--name");
     argv.add(spec.containerName());
-    // One network per environment; the alias is what peers in the environment resolve, and it
-    // stays stable across deployments while container names do not.
+    // Docker takes ONE network at run time — the application's own for an environment application,
+    // qits-platform for a singleton. Every further membership is a `network connect` after the
+    // start (DeployService.desiredJoins). The alias is what peers resolve, and it stays stable
+    // across deployments while container names do not.
     argv.add("--network");
     argv.add(spec.network());
     argv.add("--network-alias");
@@ -423,12 +623,25 @@ public class DockerDeploymentDriver implements DeploymentDriver {
     // its own restart.
     argv.add("--restart");
     argv.add("unless-stopped");
-    argv.add("--label");
-    argv.add(ENVIRONMENT_LABEL + "=" + spec.environmentId());
+    // A singleton gets NO environment label, and the absence is the feature: an environment
+    // teardown reaps every container carrying its id, and a platform-plane container must never
+    // go down with a tier it merely serves.
+    if (spec.environmentId() != null) {
+      argv.add("--label");
+      argv.add(ENVIRONMENT_LABEL + "=" + spec.environmentId());
+    }
     argv.add("--label");
     argv.add(APPLICATION_LABEL + "=" + spec.applicationId());
     argv.add("--label");
     argv.add(DEPLOYMENT_LABEL + "=" + spec.deploymentId());
+    // What a reconciliation looks this container up by when a network it belongs on is created
+    // later: the plane it is on, whether it is a public node, and the alias it must keep.
+    argv.add("--label");
+    argv.add(TARGET_LABEL + "=" + spec.target().name().toLowerCase(Locale.ROOT));
+    argv.add("--label");
+    argv.add(AVAILABLE_ON_ENV_LABEL + "=" + spec.availableOnEnv());
+    argv.add("--label");
+    argv.add(APP_NAME_LABEL + "=" + spec.applicationName());
     // The health gate, enforced by docker inside the container (see the class javadoc). The path
     // is allowlist-validated; nothing else in this string varies.
     argv.add("--health-cmd");
@@ -441,7 +654,11 @@ public class DockerDeploymentDriver implements DeploymentDriver {
     argv.add(healthStartPeriodSeconds + "s");
     // Who and where this container is, for its own logs/telemetry. Deliberately minimal —
     // application config (datasources, peers) is the image's and the environment's own story.
-    env(argv, "QITS_ENVIRONMENT", spec.environmentName());
+    // QITS_ENVIRONMENT is written for environment applications ONLY: a singleton serves every
+    // environment, and telling it that it lives in one would be a statement that is not true.
+    if (spec.environmentName() != null) {
+      env(argv, "QITS_ENVIRONMENT", spec.environmentName());
+    }
     env(argv, "QITS_APPLICATION", spec.applicationName());
     // The same identity again, in the vocabulary OpenTelemetry reads (see resourceAttributes).
     String resourceAttributes = resourceAttributes(spec);
@@ -473,7 +690,8 @@ public class DockerDeploymentDriver implements DeploymentDriver {
    *   <li>{@code service.version} — the deployment's commit sha. cd deploys sha-addressed images,
    *       so the sha IS the released identity; it is not a version number and is not dressed up as
    *       one.
-   *   <li>{@code deployment.environment.name} — the environment this container belongs to.
+   *   <li>{@code deployment.environment.name} — the environment this container belongs to, or
+   *       {@code platform} for a singleton, which belongs to all of them.
    *   <li>{@code service.instance.id} — the container name cd assigned, which is unique per
    *       deployment and stable for the process' lifetime.
    * </ul>
@@ -511,7 +729,9 @@ public class DockerDeploymentDriver implements DeploymentDriver {
     // dns label. This is what makes loosening one of those checks a failed deployment instead.
     String version = CdIdentifiers.requireAttributeValue(spec.commitSha(), "commit sha");
     String environment =
-        CdIdentifiers.requireAttributeValue(spec.environmentName(), "environment name");
+        CdIdentifiers.requireAttributeValue(
+            spec.environmentName() == null ? SINGLETON_ENVIRONMENT : spec.environmentName(),
+            "environment name");
     String instance = CdIdentifiers.requireAttributeValue(spec.containerName(), "container name");
     return "service.version="
         + version

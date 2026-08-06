@@ -45,7 +45,7 @@ public class CdEnvironmentApiTest {
         .then()
         .statusCode(201)
         .body("environment.name", equalTo("env-conventions"))
-        .body("environment.branch", equalTo("epic/env-conventions"))
+        .body("environment.branch", equalTo("environment/env-conventions"))
         .body("environment.network", equalTo("qits-env-env-conventions"))
         .body("environment.applications", hasSize(1))
         .body("environment.applications[0].repoId", equalTo("repo-conventions"))
@@ -129,6 +129,174 @@ public class CdEnvironmentApiTest {
         .post("/cd/api/environments")
         .then()
         .statusCode(400);
+  }
+
+  @Test
+  public void applicationsAreOptionalOnCreate() {
+    // The shape every caller should send now: a tier is created, and what it holds is derived from
+    // each repository's own deployments.yml on the next green build.
+    given()
+        .contentType(ContentType.JSON)
+        .body(Map.of("name", "env-bare"))
+        .when()
+        .post("/cd/api/environments")
+        .then()
+        .statusCode(201)
+        .body("environment.branch", equalTo("environment/env-bare"))
+        .body("environment.applications", hasSize(0));
+  }
+
+  @Test
+  public void patchRenamesAndRetargetsWithoutTouchingDocker() {
+    String environmentId =
+        given()
+            .contentType(ContentType.JSON)
+            .body(Map.of("name", "env-patch"))
+            .when()
+            .post("/cd/api/environments")
+            .then()
+            .statusCode(201)
+            .extract()
+            .path("environment.id");
+    driver.reset();
+
+    given()
+        .contentType(ContentType.JSON)
+        .body(Map.of("name", "env-patched", "branch", "environment/env-patched"))
+        .when()
+        .patch("/cd/api/environments/" + environmentId)
+        .then()
+        .statusCode(200)
+        .body("environment.name", equalTo("env-patched"))
+        .body("environment.branch", equalTo("environment/env-patched"))
+        // The bundle network is NOT renamed with it: the rename is a row change, and the running
+        // containers keep the networks they are on until their own next deploy.
+        .body("environment.network", equalTo("qits-env-env-patch"));
+
+    // This is the migration path onto the branch convention, so it must be safe on a live tier:
+    // nothing was ensured, removed, disconnected or reaped.
+    assertTrue(driver.calls().isEmpty(), "PATCH has no docker side effects: " + driver.calls());
+    assertTrue(driver.removedEnvironments().isEmpty());
+  }
+
+  @Test
+  public void patchLeavesAnOmittedFieldAloneAndRejectsWhatCreateWouldReject() {
+    String environmentId =
+        given()
+            .contentType(ContentType.JSON)
+            .body(Map.of("name", "env-patch-partial"))
+            .when()
+            .post("/cd/api/environments")
+            .then()
+            .statusCode(201)
+            .extract()
+            .path("environment.id");
+
+    given()
+        .contentType(ContentType.JSON)
+        .body(Map.of("branch", "environment/dev"))
+        .when()
+        .patch("/cd/api/environments/" + environmentId)
+        .then()
+        .statusCode(200)
+        .body("environment.name", equalTo("env-patch-partial"))
+        .body("environment.branch", equalTo("environment/dev"));
+
+    given()
+        .contentType(ContentType.JSON)
+        .body(Map.of("name", "Evil Name"))
+        .when()
+        .patch("/cd/api/environments/" + environmentId)
+        .then()
+        .statusCode(400);
+
+    given()
+        .contentType(ContentType.JSON)
+        .body(Map.of("branch", "bad//branch"))
+        .when()
+        .patch("/cd/api/environments/" + environmentId)
+        .then()
+        .statusCode(400);
+
+    given()
+        .contentType(ContentType.JSON)
+        .body(Map.of("name", "env-patch-partial"))
+        .when()
+        .patch("/cd/api/environments/no-such-environment")
+        .then()
+        .statusCode(404);
+  }
+
+  @Test
+  public void renamingOntoATakenNameIsAConflict() {
+    given()
+        .contentType(ContentType.JSON)
+        .body(Map.of("name", "env-patch-taken"))
+        .when()
+        .post("/cd/api/environments")
+        .then()
+        .statusCode(201);
+    String environmentId =
+        given()
+            .contentType(ContentType.JSON)
+            .body(Map.of("name", "env-patch-other"))
+            .when()
+            .post("/cd/api/environments")
+            .then()
+            .statusCode(201)
+            .extract()
+            .path("environment.id");
+
+    given()
+        .contentType(ContentType.JSON)
+        .body(Map.of("name", "env-patch-taken"))
+        .when()
+        .patch("/cd/api/environments/" + environmentId)
+        .then()
+        .statusCode(409);
+
+    // Renaming an environment to the name it already has is not a conflict with itself.
+    given()
+        .contentType(ContentType.JSON)
+        .body(Map.of("name", "env-patch-other"))
+        .when()
+        .patch("/cd/api/environments/" + environmentId)
+        .then()
+        .statusCode(200);
+  }
+
+  @Test
+  public void teardownFreesTheSingletonsBeforeRemovingTheDerivedNetworks() {
+    String environmentId =
+        given()
+            .contentType(ContentType.JSON)
+            .body(Map.of("name", "env-derived-teardown"))
+            .when()
+            .post("/cd/api/environments")
+            .then()
+            .statusCode(201)
+            .extract()
+            .path("environment.id");
+    driver.scriptExistingNetwork(
+        new eu.wohlben.qits.cd.control.DeploymentDriver.Network(
+            "qits-env-env-derived-teardown-app-x",
+            environmentId,
+            eu.wohlben.qits.cd.control.DeploymentDriver.NetworkKind.APPLICATION,
+            "app-x"));
+    driver.scriptSingletonContainers(
+        List.of(new eu.wohlben.qits.cd.control.DeploymentDriver.Endpoint("idp-id", "qits-idp")));
+
+    given().when().delete("/cd/api/environments/" + environmentId).then().statusCode(204);
+
+    // A singleton survives the tier it merely served, so it is what holds the networks open —
+    // docker refuses to remove a network with an endpoint on it.
+    assertTrue(
+        driver.disconnections().contains("qits-env-env-derived-teardown-app-x:idp-id"),
+        "singletons leave the derived networks first: " + driver.disconnections());
+    assertTrue(driver.removedNetworks().contains("qits-env-env-derived-teardown"));
+    assertTrue(
+        driver.removedNetworks().contains("qits-env-env-derived-teardown-app-x"),
+        "the derived per-application networks go too: " + driver.removedNetworks());
   }
 
   @Test

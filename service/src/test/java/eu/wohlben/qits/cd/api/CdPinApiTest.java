@@ -45,10 +45,10 @@ public class CdPinApiTest {
     String staging = createEnvironment("pins-staging", "repo-pins", "app-pins");
     String live = createEnvironment("pins-live", "repo-pins", "app-pins");
 
-    deploy("repo-pins", "epic/pins-staging", SHA_A, staging, 1);
-    deploy("repo-pins", "epic/pins-staging", SHA_B, staging, 2);
-    deploy("repo-pins", "epic/pins-live", SHA_C, live, 1);
-    deploy("repo-pins", "epic/pins-live", SHA_D, live, 2);
+    deploy("repo-pins", "environment/pins-staging", SHA_A, staging, 1);
+    deploy("repo-pins", "environment/pins-staging", SHA_B, staging, 2);
+    deploy("repo-pins", "environment/pins-live", SHA_C, live, 1);
+    deploy("repo-pins", "environment/pins-live", SHA_D, live, 2);
 
     // Serving shas sorted, then rollback shas sorted — a union over environments has no recency to
     // order by, so the answer is stable rather than pretending to be a sequence.
@@ -63,10 +63,10 @@ public class CdPinApiTest {
     // the serving sha, and no rollback target, because nothing ever served before it. The failed
     // sha is pinned by nothing: no container was created from it.
     String environmentId = createEnvironment("pins-gate", "repo-pins-gate", "app-pins-gate");
-    deploy("repo-pins-gate", "epic/pins-gate", SHA_A, environmentId, 1);
+    deploy("repo-pins-gate", "environment/pins-gate", SHA_A, environmentId, 1);
 
     driver.scriptHealth(new DeploymentDriver.HealthResult(false, "container exited"));
-    deploy("repo-pins-gate", "epic/pins-gate", SHA_B, environmentId, 2);
+    deploy("repo-pins-gate", "environment/pins-gate", SHA_B, environmentId, 2);
 
     assertEquals(List.of(SHA_A), shasOf("app-pins-gate"));
   }
@@ -76,12 +76,12 @@ public class CdPinApiTest {
     // Three green builds in a row: the newest serves, the one before it is the rollback target, and
     // the oldest is pinned by nothing — one rollback step is what cd can actually perform.
     String environmentId = createEnvironment("pins-steps", "repo-pins-steps", "app-pins-steps");
-    deploy("repo-pins-steps", "epic/pins-steps", SHA_A, environmentId, 1);
-    deploy("repo-pins-steps", "epic/pins-steps", SHA_B, environmentId, 2);
+    deploy("repo-pins-steps", "environment/pins-steps", SHA_A, environmentId, 1);
+    deploy("repo-pins-steps", "environment/pins-steps", SHA_B, environmentId, 2);
 
     assertEquals(List.of(SHA_B, SHA_A), shasOf("app-pins-steps"));
 
-    deploy("repo-pins-steps", "epic/pins-steps", SHA_C, environmentId, 3);
+    deploy("repo-pins-steps", "environment/pins-steps", SHA_C, environmentId, 3);
 
     assertEquals(List.of(SHA_C, SHA_B), shasOf("app-pins-steps"));
   }

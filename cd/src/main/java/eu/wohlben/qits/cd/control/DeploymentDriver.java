@@ -1,5 +1,6 @@
 package eu.wohlben.qits.cd.control;
 
+import eu.wohlben.qits.cd.entity.CdDeploymentTarget;
 import java.time.Duration;
 import java.util.List;
 
@@ -10,25 +11,97 @@ import java.util.List;
  * suites install a scripted fake so a clone's {@code mvn verify} needs no docker.
  *
  * <p>Everything crossing this seam is ids, names and references — never entities. The driver knows
- * nothing about environments or deployments; it starts, watches and removes containers.
+ * nothing about environments or deployments; it starts, watches and removes containers, and it
+ * makes and joins networks.
+ *
+ * <p><b>Docker is the membership bookkeeping.</b> Which container sits on which network is never
+ * stored in cd's database — it is read back from the labels below. One record of the truth, and it
+ * is the runtime's, so a row cannot describe a topology docker does not have.
  */
 public interface DeploymentDriver {
 
-  /** Best-effort ensure the named docker network exists — warn, never fail, when docker is absent. */
-  void ensureNetwork(String network);
+  /** The environment a container belongs to. Absent on singletons: they belong to no tier. */
+  String ENVIRONMENT_LABEL = "qits.cd.environment";
+
+  String APPLICATION_LABEL = "qits.cd.application";
+  String DEPLOYMENT_LABEL = "qits.cd.deployment";
+
+  /** {@code environment} or {@code singleton} — what a reconciliation looks a container up by. */
+  String TARGET_LABEL = "qits.cd.target";
+
+  /** {@code true} on an environment's public nodes — the other half of the reconciliation lookup. */
+  String AVAILABLE_ON_ENV_LABEL = "qits.cd.available-on-env";
+
+  /** On networks: {@code bundle}, {@code application} or {@code platform}. */
+  String NETWORK_LABEL = "qits.cd.network";
+
+  /** On per-application networks: whose it is. */
+  String APP_NAME_LABEL = "qits.cd.app-name";
+
+  /** What a network cd made is for. */
+  enum NetworkKind {
+    /** An environment's public nodes ({@code availableOnEnv}). */
+    BUNDLE,
+    /** One application of one environment — its own containers and its joined hub. */
+    APPLICATION,
+    /** Where singletons run. Belongs to no environment. */
+    PLATFORM
+  }
+
+  /** A network cd made, as its labels describe it. {@code environmentId} is null on PLATFORM. */
+  record Network(String name, String environmentId, NetworkKind kind, String applicationName) {}
+
+  /**
+   * Best-effort ensure the network exists, labelled — warn, never fail, when docker is absent.
+   *
+   * <p>Returns whether this call <b>created</b> it. That answer drives the reconciliation: a
+   * freshly made per-application network has nobody on it yet, so the environment's public nodes
+   * and every singleton have to be joined to it before anything can reach the application. An
+   * already-existing network keeps whatever labels it has — adopting an unlabelled network made
+   * outside cd (the platform's own {@code qits-net}) stays supported, deliberately.
+   */
+  boolean ensureNetwork(Network spec);
 
   /** Best-effort remove the named docker network (it may still hold containers; docker refuses). */
   void removeNetwork(String network);
+
+  /** Every network cd labelled — the membership bookkeeping, read back from the runtime. */
+  List<Network> networks();
+
+  /** Join the container to the network under the alias. Already joined is not an error. */
+  void connect(String network, String container, String alias);
+
+  /** Leave the network. Not being on it is not an error. */
+  void disconnect(String network, String container);
+
+  /** The running containers of an environment's public nodes — one half of a reconciliation. */
+  List<Endpoint> hubContainers(String environmentId);
+
+  /** Every running singleton container — the other half; singletons are everywhere by design. */
+  List<Endpoint> singletonContainers();
+
+  /**
+   * A container a reconciliation joins to a new network, and the alias it must keep there. The
+   * alias is the application name, and joining without it would put the container on the network
+   * under nothing but its own deployment-suffixed container name — reachable by an address no peer
+   * has ever been told.
+   */
+  record Endpoint(String id, String alias) {}
 
   /** {@code docker pull} the reference so a missing image is its own recorded outcome. */
   PullResult pull(String imageRef);
 
   /**
-   * The containers currently answering to the application's alias on the environment's network —
+   * The containers currently answering to the application's alias anywhere in the given networks —
    * the predecessors a replace cutover stops, whoever started them: a prior deployment, or an
    * original this platform's bootstrap seeded outside cd.
+   *
+   * <p>The list is the <b>union</b> of everything the fresh container is about to be on, legacy
+   * network included. That breadth is what finds a predecessor still living on the old topology: a
+   * container started before per-application networks existed holds its alias on {@code qits-net}
+   * and nowhere else, and a search of the new networks alone would start a second copy beside it.
    */
-  List<Holder> aliasHolders(String network, String alias);
+  List<Holder> aliasHolders(List<String> networks, String alias);
 
   /** Stop the container, leaving it restartable — the first half of the replace cutover. */
   void stop(String containerName);
@@ -59,7 +132,7 @@ public interface DeploymentDriver {
   record HandoffSpec(
       String imageRef, String oldContainerId, String newContainerName, long timeoutSeconds) {}
 
-  /** Start the container, detached, on the environment's network. The image's entrypoint runs. */
+  /** Start the container, detached, on its primary network. The image's entrypoint runs. */
   StartResult start(StartSpec spec);
 
   /**
@@ -83,6 +156,15 @@ public interface DeploymentDriver {
    * <p>{@code commitSha} is carried beside {@code imageRef} rather than parsed back out of it: it
    * is the deployment's own identity — the sha the row was created with and the image was
    * addressed by — and it becomes the container's {@code service.version} resource attribute.
+   *
+   * <p>{@code network} is the <b>primary</b> one, the only one {@code docker run} can take: the
+   * application's own network for an environment application, {@code qits-platform} for a
+   * singleton. Every further membership is a join after the start, because docker allows exactly
+   * one network at run time.
+   *
+   * <p>{@code environmentId} and {@code environmentName} are null on a singleton, which is what
+   * leaves it without an environment label — an environment teardown reaps by that label, and it
+   * must never take a platform-plane container with it.
    */
   record StartSpec(
       String environmentId,
@@ -94,7 +176,9 @@ public interface DeploymentDriver {
       String network,
       String imageRef,
       String containerName,
-      String healthPath) {}
+      String healthPath,
+      CdDeploymentTarget target,
+      boolean availableOnEnv) {}
 
   enum PullOutcome {
     OK,

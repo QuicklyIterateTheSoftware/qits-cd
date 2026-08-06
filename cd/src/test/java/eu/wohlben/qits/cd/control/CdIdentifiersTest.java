@@ -92,6 +92,10 @@ class CdIdentifiersTest {
     assertEquals(
         "qits-cd-some-epic-qits-gateway-0123abcd",
         DeployService.containerName("some-epic", "qits-gateway", "0123abcd-ffff-4000-8000-0000"));
+    // A singleton has no environment to be named after, so the plane takes that place.
+    assertEquals(
+        "qits-cd-singleton-qits-cd-0123abcd",
+        DeployService.containerName(null, "qits-cd", "0123abcd-ffff-4000-8000-0000"));
   }
 
   @Test

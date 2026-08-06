@@ -7,10 +7,10 @@ import eu.wohlben.qits.cd.mapper.CdMapper;
 import jakarta.inject.Inject;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.NotNull;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;
 import jakarta.ws.rs.GET;
+import jakarta.ws.rs.PATCH;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
@@ -22,10 +22,15 @@ import org.eclipse.microprofile.openapi.annotations.Operation;
 import org.eclipse.microprofile.openapi.annotations.responses.APIResponse;
 
 /**
- * The environment surface: creation and teardown (machine calls from the epic orchestration, on
- * qits-net where callers are trusted; the front door session-guards the paths) and the reads. The
- * environment is the aggregate here — applications live inside it, deployments are read via
- * {@code CdDeploymentController} with the environment as a required filter.
+ * The environment surface: creating a tier, renaming or retargeting it, tearing it down, and the
+ * reads. The environment is the aggregate here — an environment's applications are read with it,
+ * deployments are read via {@code CdDeploymentController} with the environment as a required
+ * filter, and the flat application registry (singletons included) is {@code
+ * CdApplicationController}.
+ *
+ * <p>A tier is created <b>deliberately</b>; what it holds is not. Application rows are derived from
+ * each repository's {@code deployments.yml} on every green build, so this surface has no write for
+ * them and gained none.
  *
  * <p>Deliberately <b>not</b> {@code @Operation(hidden = true)}: unlike the intake, this is the API
  * of this service — the thing a client (human or the epic orchestration) is written against — so it
@@ -45,18 +50,36 @@ public class CdEnvironmentController {
   @Inject EnvironmentService environmentService;
   @Inject CdMapper mapper;
 
-  /** One tracked application. {@code healthPath} null means the shipped default. */
+  /**
+   * One tracked application. {@code healthPath} null means the shipped default.
+   *
+   * @deprecated applications are derived from each repository's {@code deployments.yml} on every
+   *     green build — see {@link CreateEnvironmentRequest#applications()}.
+   */
+  @Deprecated
   public record ApplicationSpec(@NotBlank String repoId, @NotBlank String name, String healthPath) {}
 
   /**
    * The creation payload. {@code branch} and {@code network} are conventions when omitted: {@code
-   * epic/<name>} and {@code qits-env-<name>}.
+   * environment/<name>} and {@code qits-env-<name>}.
+   *
+   * <p>{@code applications} is <b>optional and deprecated</b>. Application rows are derived from
+   * each repository's own {@code .config/qits/deployments.yml} on every green build, so naming them
+   * here only pre-creates what the next build would create anyway — and pre-creating them states a
+   * topology the repository has not agreed to. It is still accepted so an older bootstrap keeps
+   * working; send nothing.
    */
   public record CreateEnvironmentRequest(
       @NotBlank String name,
       String branch,
       String network,
-      @NotNull List<@Valid ApplicationSpec> applications) {}
+      @Deprecated List<@Valid ApplicationSpec> applications) {}
+
+  /**
+   * The rename/retarget payload — both fields optional, an omitted one is left alone. This is how
+   * an environment moves onto the {@code environment/<name>} branch convention.
+   */
+  public record UpdateEnvironmentRequest(String name, String branch) {}
 
   public record EnvironmentResponse(CdEnvironmentDto environment) {}
 
@@ -68,15 +91,40 @@ public class CdEnvironmentController {
   @APIResponse(responseCode = "400", description = "A name, branch or path failed validation")
   @APIResponse(responseCode = "409", description = "An environment of that name already exists")
   public Response create(@Valid CreateEnvironmentRequest request) {
+    List<ApplicationSpec> declared =
+        request.applications() == null ? List.of() : request.applications();
     CdEnvironment environment =
         environmentService.create(
             request.name(),
             request.branch(),
             request.network(),
-            request.applications().stream()
+            declared.stream()
                 .map(a -> new EnvironmentService.ApplicationSpec(a.repoId(), a.name(), a.healthPath()))
                 .toList());
     return Response.status(Response.Status.CREATED).entity(toResponse(environment)).build();
+  }
+
+  /**
+   * Rename an environment or point it at another branch. <b>No docker side effects</b> — a rename
+   * that tore containers down would be a delete in disguise, and delete is the one thing never to
+   * reach for on a live environment. The next deployment of each application moves it onto the
+   * networks the new name derives; what runs now keeps running.
+   */
+  @PATCH
+  @Path("/{environmentId}")
+  @Operation(summary = "Rename an environment or point it at another branch")
+  @APIResponse(responseCode = "200", description = "The updated environment")
+  @APIResponse(responseCode = "400", description = "A name or branch failed validation")
+  @APIResponse(responseCode = "404", description = "No such environment")
+  @APIResponse(responseCode = "409", description = "Another environment already has that name")
+  public EnvironmentResponse update(
+      @PathParam("environmentId") String environmentId, UpdateEnvironmentRequest request) {
+    CdEnvironment environment =
+        environmentService.update(
+            environmentId,
+            request == null ? null : request.name(),
+            request == null ? null : request.branch());
+    return toResponse(environment);
   }
 
   /** All environments, newest-first, without their applications (fetch one for the full shape). */

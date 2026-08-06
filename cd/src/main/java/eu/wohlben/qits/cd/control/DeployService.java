@@ -1,10 +1,14 @@
 package eu.wohlben.qits.cd.control;
 
+import eu.wohlben.qits.cd.control.CdSpecSource.DeploymentSpec;
 import eu.wohlben.qits.cd.entity.CdApplication;
 import eu.wohlben.qits.cd.entity.CdDeployment;
 import eu.wohlben.qits.cd.entity.CdDeploymentStatus;
+import eu.wohlben.qits.cd.entity.CdDeploymentTarget;
+import eu.wohlben.qits.cd.entity.CdEnvironment;
 import eu.wohlben.qits.cd.persistence.CdApplicationRepository;
 import eu.wohlben.qits.cd.persistence.CdDeploymentRepository;
+import eu.wohlben.qits.cd.persistence.CdEnvironmentRepository;
 import io.quarkus.narayana.jta.QuarkusTransaction;
 import io.quarkus.runtime.LaunchMode;
 import io.quarkus.runtime.StartupEvent;
@@ -17,6 +21,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -25,11 +30,18 @@ import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 /**
- * The deployment orchestrator: a build-succeeded event → the applications listening to that (repo,
- * branch) → one recorded deployment each, driven pull → run → health gate → cutover on a
- * single-threaded daemon worker (the intake returns immediately; deployments across all
- * environments are serialized — parallelism is an explicit follow-up, and serial is what makes
- * "the previous ACTIVE deployment" an uncontended read).
+ * The deployment orchestrator: a build-succeeded event → the repository's deployment spec at that
+ * commit → the applications that spec addresses → one recorded deployment each, driven pull → run →
+ * join → health gate → cutover on a single-threaded daemon worker (the intake returns immediately;
+ * deployments across all environments are serialized — parallelism is an explicit follow-up, and
+ * serial is what makes "the previous ACTIVE deployment" an uncontended read).
+ *
+ * <p><b>Registration is derived.</b> Nothing declares an application over the API. A green build
+ * carries cd to {@code .config/qits/deployments.yml} in the repository at that sha, and the row is
+ * created or brought up to date from it: an {@code environment} target registers into every
+ * environment whose branch matches, a {@code singleton} target registers once for the whole
+ * platform if the build is on the singleton's own branch. A repository with no such file gets the
+ * defaults and behaves exactly as it did before the file existed.
  *
  * <p>Each DB transition sits in its own {@link QuarkusTransaction#requiringNew()} bracket so the
  * slow docker work never holds a transaction, and everything the docker calls need is copied out
@@ -42,9 +54,10 @@ import org.jboss.logging.Logger;
  * overlapping cutover this service first shipped) is what makes stateful applications deployable
  * at all: one process per H2 file, one binder per published host port. The pull still happens
  * before the stop, so replacing the registry's own application does not depend on the registry
- * being up mid-cutover. The predecessor is whatever holds the application's alias on the
- * environment's network — including containers cd did not start (a bootstrap's seeded originals),
- * which is how the platform's compose-managed first boot hands itself over to cd. The one
+ * being up mid-cutover. The predecessor is whatever holds the application's alias on any of the
+ * networks the fresh container is about to be on — including containers cd did not start (a
+ * bootstrap's seeded originals) and containers still living on the legacy network alone, which is
+ * how the platform migrates onto per-application networks without ever running two copies. The one
  * predecessor cd never stops in-process is its own container: deploying cd itself takes the
  * handoff path — start the successor, launch the detached referee that stops this instance and
  * arbitrates the gate, and let the surviving instance record the outcome (the successor's sweep
@@ -56,8 +69,10 @@ public class DeployService {
   private static final Logger LOG = Logger.getLogger(DeployService.class);
 
   @Inject CdApplicationRepository applications;
+  @Inject CdEnvironmentRepository environments;
   @Inject CdDeploymentRepository deployments;
   @Inject DeploymentDriver driver;
+  @Inject CdSpecSource specs;
 
   @ConfigProperty(name = "qits.artifacts.registry-host")
   String registryHost;
@@ -70,6 +85,19 @@ public class DeployService {
 
   @ConfigProperty(name = "qits.cd.health-timeout-seconds")
   long healthTimeoutSeconds;
+
+  /**
+   * The network every fresh container additionally joins while the platform still holds direct
+   * cross-application URLs. Emptying it is the enforcement flip: from then on an application can
+   * only be reached through the gateway route or a hub join, and a URL nobody migrated fails
+   * loudly instead of resolving on a flat network.
+   *
+   * <p>{@code Optional} because SmallRye reads an empty value as ABSENT, not as an empty string —
+   * so the flip's own spelling ({@code QITS_CD_LEGACY_NETWORK=}) would fail this bean's injection
+   * if the field were a plain String.
+   */
+  @ConfigProperty(name = "qits.cd.legacy-network")
+  Optional<String> legacyNetwork;
 
   private final ExecutorService worker =
       Executors.newSingleThreadExecutor(
@@ -151,8 +179,14 @@ public class DeployService {
 
   /**
    * The async entry the build-succeeded intake calls — returns immediately with how many
-   * deployments were queued (zero when no environment listens to the branch, which is the normal
-   * case for every push to a branch without an environment and not worth an error).
+   * deployments were recorded (zero when nothing listens to the branch, which is the normal case
+   * for every push to a branch no environment tracks and not worth an error).
+   *
+   * <p>The spec read happens here, synchronously, because it decides <b>which rows exist</b> —
+   * there is nothing to queue until it has answered. A read that fails (the git host is down, the
+   * file does not parse) does not guess: the applications already registered for this (repo,
+   * branch) each get a recorded {@code FAILED} deployment naming the cause, and a repository with
+   * no rows yet gets nothing, exactly as an unknown repository always has.
    *
    * <p>{@code runId} is optional and is recorded on every row this queues, verbatim: it is the only
    * pointer from a deployment back to the build that caused it, and cd resolves it against nothing —
@@ -165,24 +199,25 @@ public class DeployService {
     CdIdentifiers.requireBranch(branch);
     CdIdentifiers.requireSha(commitSha);
 
-    List<String> queued =
-        QuarkusTransaction.requiringNew()
-            .call(
-                () -> {
-                  List<String> ids = new ArrayList<>();
-                  for (CdApplication app : applications.listByRepoAndBranch(repoId, branch)) {
-                    CdDeployment deployment = new CdDeployment();
-                    deployment.id = UUID.randomUUID().toString();
-                    deployment.application = app;
-                    deployment.commitSha = commitSha;
-                    deployment.runId = runId;
-                    deployment.status = CdDeploymentStatus.QUEUED;
-                    deployment.createdAt = Instant.now();
-                    deployments.persist(deployment);
-                    ids.add(deployment.id);
-                  }
-                  return ids;
-                });
+    DeploymentSpec spec = null;
+    String specFailure = null;
+    try {
+      spec = specs.read(repoId, commitSha);
+    } catch (RuntimeException e) {
+      specFailure = "[deployment spec unreadable: " + e.getMessage() + "]";
+      LOG.warnf("Could not read the deployment spec of %s@%s: %s", repoId, commitSha, e.getMessage());
+    }
+
+    List<String> applicationIds =
+        spec == null ? alreadyRegistered(repoId, branch) : register(repoId, branch, spec);
+    List<String> queued = queue(runId, commitSha, applicationIds);
+
+    if (specFailure != null) {
+      for (String deploymentId : queued) {
+        finish(deploymentId, CdDeploymentStatus.FAILED, specFailure);
+      }
+      return queued.size();
+    }
     for (String deploymentId : queued) {
       worker.submit(
           () -> {
@@ -197,16 +232,175 @@ public class DeployService {
     return queued.size();
   }
 
+  /**
+   * Bring the rows this build addresses up to date with what the repository declares, and answer
+   * which applications to deploy. The whole of derived registration.
+   */
+  private List<String> register(String repoId, String branch, DeploymentSpec spec) {
+    if (!isDeployableName(repoId)) {
+      // The application name is the image path segment and the network alias, so it has to be a
+      // dns label. A repository whose id is not one cannot be deployed by convention at all, and
+      // the intake is fire-and-forget — saying so in the log beats a 400 nobody reads.
+      LOG.warnf("Repository %s cannot be an application name, so nothing was registered", repoId);
+      return List.of();
+    }
+    return QuarkusTransaction.requiringNew()
+        .call(
+            () ->
+                spec.target() == CdDeploymentTarget.SINGLETON
+                    ? registerSingleton(repoId, branch, spec)
+                    : registerInEnvironments(repoId, branch, spec));
+  }
+
+  private List<String> registerInEnvironments(String repoId, String branch, DeploymentSpec spec) {
+    List<String> ids = new ArrayList<>();
+    for (CdEnvironment environment : environments.listByBranch(branch)) {
+      CdApplication application =
+          applications
+              .findByEnvironmentAndRepo(environment.id, repoId)
+              .orElseGet(
+                  () -> {
+                    CdApplication fresh = new CdApplication();
+                    fresh.id = UUID.randomUUID().toString();
+                    fresh.environment = environment;
+                    fresh.repoId = repoId;
+                    fresh.name = repoId;
+                    fresh.createdAt = Instant.now();
+                    applications.persist(fresh);
+                    LOG.infof("Registered %s in environment %s", repoId, environment.name);
+                    return fresh;
+                  });
+      application.deploymentTarget = CdDeploymentTarget.ENVIRONMENT;
+      application.availableOnEnv = spec.availableOnEnv();
+      application.branch = null; // an environment application takes its branch from its tier
+      ids.add(application.id);
+    }
+    return ids;
+  }
+
+  /**
+   * The singleton half, including the conversion the live migration depends on: a repository that
+   * was an environment application until this commit has rows in every environment it was in, and
+   * those rows have to become the one singleton row rather than sit beside it. Their deployment
+   * history is <b>moved onto the singleton</b> — the active ones decommissioned, since the
+   * application they described is about to be replaced from a different plane — and only then are
+   * the old rows removed. Moving rather than deleting is what keeps an in-flight self-update row
+   * alive across cd's own conversion; the containers those rows started are absorbed by the next
+   * cutover, which finds them on the legacy network exactly as it finds any other predecessor.
+   */
+  private List<String> registerSingleton(String repoId, String branch, DeploymentSpec spec) {
+    if (!branch.equals(spec.singletonBranch())) {
+      return List.of();
+    }
+    Optional<CdApplication> nameTaken = applications.findSingletonByName(repoId);
+    if (nameTaken.isPresent() && !nameTaken.get().repoId.equals(repoId)) {
+      LOG.errorf(
+          "Singleton name %s already belongs to repository %s — %s was not registered",
+          repoId, nameTaken.get().repoId, repoId);
+      return List.of();
+    }
+    CdApplication singleton =
+        applications
+            .findSingletonByRepo(repoId)
+            .orElseGet(
+                () -> {
+                  CdApplication fresh = new CdApplication();
+                  fresh.id = UUID.randomUUID().toString();
+                  fresh.repoId = repoId;
+                  fresh.name = repoId;
+                  fresh.createdAt = Instant.now();
+                  applications.persist(fresh);
+                  LOG.infof("Registered %s as a platform singleton", repoId);
+                  return fresh;
+                });
+    singleton.environment = null;
+    singleton.deploymentTarget = CdDeploymentTarget.SINGLETON;
+    singleton.availableOnEnv = false;
+    singleton.branch = spec.singletonBranch();
+
+    for (CdApplication scoped : applications.listEnvironmentScopedByRepo(repoId)) {
+      for (CdDeployment deployment : deployments.listByApplication(scoped.id)) {
+        if (deployment.status == CdDeploymentStatus.ACTIVE) {
+          deployment.status = CdDeploymentStatus.DECOMMISSIONED;
+          deployment.finishedAt = Instant.now();
+        }
+        deployment.application = singleton;
+      }
+      deployments.flush();
+      applications.delete(scoped);
+      LOG.infof("Converted %s from an environment application to the platform singleton", repoId);
+    }
+    return List.of(singleton.id);
+  }
+
+  /** What a failed spec read falls back to: the rows this (repo, branch) already had. */
+  private List<String> alreadyRegistered(String repoId, String branch) {
+    return QuarkusTransaction.requiringNew()
+        .call(
+            () -> {
+              List<String> ids = new ArrayList<>();
+              for (CdApplication application : applications.listByRepoAndBranch(repoId, branch)) {
+                ids.add(application.id);
+              }
+              applications
+                  .findSingletonByRepo(repoId)
+                  .filter(a -> branch.equals(a.branch))
+                  .ifPresent(a -> ids.add(a.id));
+              return ids;
+            });
+  }
+
+  private List<String> queue(String runId, String commitSha, List<String> applicationIds) {
+    if (applicationIds.isEmpty()) {
+      return List.of();
+    }
+    return QuarkusTransaction.requiringNew()
+        .call(
+            () -> {
+              List<String> ids = new ArrayList<>();
+              for (String applicationId : applicationIds) {
+                CdApplication application = applications.findById(applicationId);
+                if (application == null) {
+                  continue;
+                }
+                CdDeployment deployment = new CdDeployment();
+                deployment.id = UUID.randomUUID().toString();
+                deployment.application = application;
+                deployment.commitSha = commitSha;
+                deployment.runId = runId;
+                deployment.status = CdDeploymentStatus.QUEUED;
+                deployment.createdAt = Instant.now();
+                deployments.persist(deployment);
+                ids.add(deployment.id);
+              }
+              return ids;
+            });
+  }
+
   /** Everything a deployment needs off the worker thread — plain values, never entities. */
   private record Plan(
       String deploymentId,
       String environmentId,
       String environmentName,
-      String network,
+      String bundleNetwork,
       String applicationId,
       String applicationName,
       String sha,
-      String healthPath) {}
+      String healthPath,
+      CdDeploymentTarget target,
+      boolean availableOnEnv) {
+
+    boolean singleton() {
+      return target == CdDeploymentTarget.SINGLETON;
+    }
+
+    /** The one network {@code docker run} can take; every other membership is a join. */
+    String primaryNetwork() {
+      return singleton()
+          ? CdNetworks.PLATFORM
+          : CdNetworks.application(environmentName, applicationName);
+    }
+  }
 
   /** The synchronous deployment — package-private so tests drive it without the worker. */
   void execute(String deploymentId) {
@@ -220,15 +414,18 @@ public class DeployService {
                   }
                   deployment.status = CdDeploymentStatus.STARTING;
                   CdApplication app = deployment.application;
+                  boolean singleton = app.deploymentTarget == CdDeploymentTarget.SINGLETON;
                   return new Plan(
                       deploymentId,
-                      app.environment.id,
-                      app.environment.name,
-                      app.environment.network,
+                      singleton ? null : app.environment.id,
+                      singleton ? null : app.environment.name,
+                      singleton ? null : app.environment.network,
                       app.id,
                       app.name,
                       deployment.commitSha,
-                      app.healthPath != null ? app.healthPath : defaultHealthPath);
+                      app.healthPath != null ? app.healthPath : defaultHealthPath,
+                      app.deploymentTarget,
+                      app.availableOnEnv);
                 });
     if (plan == null) {
       return;
@@ -258,7 +455,8 @@ public class DeployService {
 
     // Named after the deployment, not the sha: re-deploying the same commit must never collide
     // with the container it is about to replace.
-    String containerName = containerName(plan.environmentName(), plan.applicationName(), deploymentId);
+    String containerName =
+        containerName(plan.environmentName(), plan.applicationName(), deploymentId);
     QuarkusTransaction.requiringNew()
         .run(
             () -> {
@@ -268,18 +466,36 @@ public class DeployService {
               }
             });
 
-    // The network is re-ensured on every deployment rather than trusted from creation time — an
-    // environment created while docker was down must heal, not stay broken.
-    driver.ensureNetwork(plan.network());
+    // Networks are re-ensured on every deployment rather than trusted from creation time — an
+    // environment created while docker was down must heal, not stay broken. Whether the primary
+    // one was CREATED here is the reconciliation trigger: a network that did not exist a moment
+    // ago has nobody on it, so the environment's public nodes and every singleton have to be
+    // joined to it or this application is unreachable from both.
+    String primaryNetwork = plan.primaryNetwork();
+    boolean primaryIsNew = driver.ensureNetwork(primaryNetworkSpec(plan));
+    if (!plan.singleton() && plan.availableOnEnv()) {
+      driver.ensureNetwork(
+          new DeploymentDriver.Network(
+              plan.bundleNetwork(),
+              plan.environmentId(),
+              DeploymentDriver.NetworkKind.BUNDLE,
+              null));
+    }
+    List<String> joins = desiredJoins(plan, primaryNetwork);
 
     // The replace cutover: whatever currently answers to the application's alias is STOPPED —
     // not removed — before the fresh container starts. Stopping first is what makes stateful
     // applications deployable at all (one process per H2 file, one binder per published host
     // port); keeping the stopped containers around is what preserves the rollback: a failed gate
-    // restarts them. This also absorbs predecessors cd did not start (the bootstrap's seeded
-    // originals) — holding the alias is what makes something the predecessor, not a row here.
+    // restarts them. The search covers every network the fresh container will be on, so it also
+    // absorbs predecessors cd did not start (the bootstrap's seeded originals) and predecessors
+    // still living on the legacy network alone (the migration onto per-application networks) —
+    // holding the alias is what makes something the predecessor, not a row here.
+    List<String> searchNetworks = new ArrayList<>();
+    searchNetworks.add(primaryNetwork);
+    searchNetworks.addAll(joins);
     List<DeploymentDriver.Holder> predecessors =
-        driver.aliasHolders(plan.network(), plan.applicationName());
+        driver.aliasHolders(List.copyOf(searchNetworks), plan.applicationName());
     String self = driver.selfContainerId();
     DeploymentDriver.Holder selfHolder =
         self.isBlank()
@@ -298,23 +514,14 @@ public class DeployService {
       // instance's own sweep marks it FAILED — each outcome recorded by the instance that
       // survived it.
       DeploymentDriver.StartResult successor =
-          driver.start(
-              new DeploymentDriver.StartSpec(
-                  plan.environmentId(),
-                  plan.environmentName(),
-                  plan.applicationId(),
-                  plan.applicationName(),
-                  deploymentId,
-                  plan.sha(),
-                  plan.network(),
-                  imageRef,
-                  containerName,
-                  plan.healthPath()));
+          driver.start(startSpec(plan, primaryNetwork, imageRef, containerName));
       if (!successor.started()) {
         driver.remove(containerName);
         finish(deploymentId, CdDeploymentStatus.FAILED, safe(successor.detail()));
         return;
       }
+      join(containerName, plan.applicationName(), joins);
+      reconcile(plan, primaryNetwork, primaryIsNew);
       driver.handoff(
           new DeploymentDriver.HandoffSpec(
               imageRef, selfHolder.id(), containerName, healthTimeoutSeconds));
@@ -328,24 +535,19 @@ public class DeployService {
     }
 
     DeploymentDriver.StartResult started =
-        driver.start(
-            new DeploymentDriver.StartSpec(
-                plan.environmentId(),
-                plan.environmentName(),
-                plan.applicationId(),
-                plan.applicationName(),
-                deploymentId,
-                plan.sha(),
-                plan.network(),
-                imageRef,
-                containerName,
-                plan.healthPath()));
+        driver.start(startSpec(plan, primaryNetwork, imageRef, containerName));
     if (!started.started()) {
       driver.remove(containerName); // in case docker created it and then failed
       rollback(predecessors);
       finish(deploymentId, CdDeploymentStatus.FAILED, safe(started.detail()));
       return;
     }
+    // Docker takes one network at `run`; everything else is a join, and the set is recomputed from
+    // docker on every deployment rather than remembered — which makes this the self-heal too: a
+    // membership lost to a manual `network disconnect` or to a network that did not exist last
+    // time is simply back on the replacement.
+    join(containerName, plan.applicationName(), joins);
+    reconcile(plan, primaryNetwork, primaryIsNew);
 
     DeploymentDriver.HealthResult health =
         driver.awaitHealthy(containerName, Duration.ofSeconds(healthTimeoutSeconds));
@@ -382,12 +584,103 @@ public class DeployService {
     for (DeploymentDriver.Holder predecessor : predecessors) {
       toRemove.add(predecessor.name());
     }
+    toRemove.remove(containerName);
     for (String oldContainer : toRemove) {
       driver.remove(oldContainer);
     }
     LOG.infof(
         "Deployed %s@%s into %s (%s)",
-        plan.applicationName(), plan.sha(), plan.environmentName(), containerName);
+        plan.applicationName(),
+        plan.sha(),
+        plan.singleton() ? "the platform" : plan.environmentName(),
+        containerName);
+  }
+
+  private DeploymentDriver.Network primaryNetworkSpec(Plan plan) {
+    return plan.singleton()
+        ? new DeploymentDriver.Network(
+            CdNetworks.PLATFORM, null, DeploymentDriver.NetworkKind.PLATFORM, null)
+        : new DeploymentDriver.Network(
+            plan.primaryNetwork(),
+            plan.environmentId(),
+            DeploymentDriver.NetworkKind.APPLICATION,
+            plan.applicationName());
+  }
+
+  private DeploymentDriver.StartSpec startSpec(
+      Plan plan, String primaryNetwork, String imageRef, String containerName) {
+    return new DeploymentDriver.StartSpec(
+        plan.environmentId(),
+        plan.environmentName(),
+        plan.applicationId(),
+        plan.applicationName(),
+        plan.deploymentId(),
+        plan.sha(),
+        primaryNetwork,
+        imageRef,
+        containerName,
+        plan.healthPath(),
+        plan.target(),
+        plan.availableOnEnv());
+  }
+
+  /**
+   * Every network the fresh container joins after it started, primary excluded.
+   *
+   * <ul>
+   *   <li>the legacy network, while {@code qits.cd.legacy-network} names one — the transition
+   *       membership that keeps today's direct cross-application URLs resolving;
+   *   <li>a public node ({@code availableOnEnv}) additionally joins its environment's bundle and
+   *       <b>every</b> per-application network of that environment: that is the hub, and it is how
+   *       an application reaches the gateway and how the gateway proxies every application;
+   *   <li>a singleton joins every per-application network of every environment — being locally
+   *       reachable everywhere is what makes it a singleton rather than a shared service that needs
+   *       a route.
+   * </ul>
+   */
+  private List<String> desiredJoins(Plan plan, String primaryNetwork) {
+    Set<String> joins = new LinkedHashSet<>();
+    legacyNetwork.map(String::strip).filter(n -> !n.isEmpty()).ifPresent(joins::add);
+    if (plan.singleton()) {
+      for (DeploymentDriver.Network network : driver.networks()) {
+        if (network.kind() == DeploymentDriver.NetworkKind.APPLICATION) {
+          joins.add(network.name());
+        }
+      }
+    } else if (plan.availableOnEnv()) {
+      joins.add(plan.bundleNetwork());
+      for (DeploymentDriver.Network network : driver.networks()) {
+        if (network.kind() == DeploymentDriver.NetworkKind.APPLICATION
+            && plan.environmentId().equals(network.environmentId())) {
+          joins.add(network.name());
+        }
+      }
+    }
+    joins.remove(primaryNetwork);
+    return List.copyOf(joins);
+  }
+
+  private void join(String containerName, String alias, List<String> networks) {
+    for (String network : networks) {
+      driver.connect(network, containerName, alias);
+    }
+  }
+
+  /**
+   * A per-application network that did not exist a moment ago has nobody on it. Join the
+   * environment's public nodes and every singleton, both found by their container labels — docker
+   * is the membership bookkeeping, so this asks the runtime rather than a table.
+   */
+  private void reconcile(Plan plan, String primaryNetwork, boolean primaryIsNew) {
+    if (!primaryIsNew || plan.singleton()) {
+      return;
+    }
+    for (DeploymentDriver.Endpoint hub : driver.hubContainers(plan.environmentId())) {
+      driver.connect(primaryNetwork, hub.id(), hub.alias());
+    }
+    for (DeploymentDriver.Endpoint singleton : driver.singletonContainers()) {
+      driver.connect(primaryNetwork, singleton.id(), singleton.alias());
+    }
   }
 
   /** A failed cutover restarts every container it stopped — the previous deployment serves again. */
@@ -419,10 +712,26 @@ public class DeployService {
     return deployments.listByEnvironmentNewestFirst(environmentId);
   }
 
-  /** One name shape for everything cd starts: qits-cd-<env>-<app>-<deployment-prefix>. */
+  /**
+   * One name shape for everything cd starts: {@code qits-cd-<env>-<app>-<deployment-prefix>}, and
+   * {@code qits-cd-singleton-<app>-<deployment-prefix>} for a singleton, which has no environment
+   * to be named after. {@code singleton} sits where an environment name would, and no environment
+   * can take that place: an environment named `singleton` would produce a container name shaped
+   * exactly like a singleton's, which is a collision only in the name and not in what is deployed.
+   */
   static String containerName(String environmentName, String applicationName, String deploymentId) {
     String shortId = deploymentId.length() > 8 ? deploymentId.substring(0, 8) : deploymentId;
-    return "qits-cd-" + environmentName + "-" + applicationName + "-" + shortId;
+    return "qits-cd-" + (environmentName == null ? "singleton" : environmentName) + "-"
+        + applicationName + "-" + shortId;
+  }
+
+  private static boolean isDeployableName(String repoId) {
+    try {
+      CdIdentifiers.requireName(repoId, "application name");
+      return true;
+    } catch (RuntimeException e) {
+      return false;
+    }
   }
 
   private static String safe(String detail) {

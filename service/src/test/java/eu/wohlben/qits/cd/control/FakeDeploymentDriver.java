@@ -6,6 +6,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 
 /**
  * The suite's stand-in for the docker seam — a scripted fake, not an honest one: it performs
@@ -23,6 +24,7 @@ import java.util.List;
 public class FakeDeploymentDriver implements DeploymentDriver {
 
   private final List<String> ensuredNetworks = Collections.synchronizedList(new ArrayList<>());
+  private final List<Network> ensuredNetworkSpecs = Collections.synchronizedList(new ArrayList<>());
   private final List<String> removedNetworks = Collections.synchronizedList(new ArrayList<>());
   private final List<String> pulledRefs = Collections.synchronizedList(new ArrayList<>());
   private final List<StartSpec> started = Collections.synchronizedList(new ArrayList<>());
@@ -35,6 +37,11 @@ public class FakeDeploymentDriver implements DeploymentDriver {
   /** Every driver call in arrival order, tagged `kind:target` — the cutover ORDER assertions. */
   private final List<String> calls = Collections.synchronizedList(new ArrayList<>());
 
+  /** Every network join and leave, as `network:container:alias` / `network:container`. */
+  private final List<String> connections = Collections.synchronizedList(new ArrayList<>());
+
+  private final List<String> disconnections = Collections.synchronizedList(new ArrayList<>());
+
   private final List<HandoffSpec> handoffs = Collections.synchronizedList(new ArrayList<>());
   private final java.util.Map<String, String> containerIds = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -43,6 +50,11 @@ public class FakeDeploymentDriver implements DeploymentDriver {
   private volatile HealthResult nextHealth = new HealthResult(true, null);
   private volatile List<Holder> nextHolders = List.of();
   private volatile String selfId = "";
+  private final List<Network> existingNetworks = Collections.synchronizedList(new ArrayList<>());
+  private final Set<String> createdNetworks = Collections.synchronizedSet(new java.util.HashSet<>());
+  private final List<Endpoint> hubs = Collections.synchronizedList(new ArrayList<>());
+  private final List<Endpoint> singletons = Collections.synchronizedList(new ArrayList<>());
+  private final List<String> aliasSearches = Collections.synchronizedList(new ArrayList<>());
 
   public void reset() {
     ensuredNetworks.clear();
@@ -55,6 +67,8 @@ public class FakeDeploymentDriver implements DeploymentDriver {
     stoppedContainers.clear();
     restartedContainers.clear();
     calls.clear();
+    connections.clear();
+    disconnections.clear();
     handoffs.clear();
     containerIds.clear();
     nextPull = new PullResult(PullOutcome.OK, null);
@@ -62,6 +76,36 @@ public class FakeDeploymentDriver implements DeploymentDriver {
     nextHealth = new HealthResult(true, null);
     nextHolders = List.of();
     selfId = "";
+    ensuredNetworkSpecs.clear();
+    existingNetworks.clear();
+    createdNetworks.clear();
+    hubs.clear();
+    singletons.clear();
+    aliasSearches.clear();
+  }
+
+  /** Networks docker already has when the test starts — ensureNetwork answers "not created". */
+  public void scriptExistingNetwork(Network network) {
+    existingNetworks.add(network);
+  }
+
+  public void scriptHubContainers(List<Endpoint> endpoints) {
+    hubs.clear();
+    hubs.addAll(endpoints);
+  }
+
+  public void scriptSingletonContainers(List<Endpoint> endpoints) {
+    singletons.clear();
+    singletons.addAll(endpoints);
+  }
+
+  /** The network sets aliasHolders was asked about, one joined string per call. */
+  public List<String> aliasSearches() {
+    return List.copyOf(aliasSearches);
+  }
+
+  public List<Network> ensuredNetworkSpecs() {
+    return List.copyOf(ensuredNetworkSpecs);
   }
 
   public void scriptContainerId(String containerName, String id) {
@@ -90,6 +134,14 @@ public class FakeDeploymentDriver implements DeploymentDriver {
 
   public List<String> calls() {
     return List.copyOf(calls);
+  }
+
+  public List<String> connections() {
+    return List.copyOf(connections);
+  }
+
+  public List<String> disconnections() {
+    return List.copyOf(disconnections);
   }
 
   public void scriptPull(PullResult result) {
@@ -133,8 +185,44 @@ public class FakeDeploymentDriver implements DeploymentDriver {
   }
 
   @Override
-  public void ensureNetwork(String network) {
-    ensuredNetworks.add(network);
+  public boolean ensureNetwork(Network spec) {
+    ensuredNetworks.add(spec.name());
+    ensuredNetworkSpecs.add(spec);
+    calls.add("ensureNetwork:" + spec.name());
+    boolean known =
+        existingNetworks.stream().anyMatch(n -> n.name().equals(spec.name()))
+            || !createdNetworks.add(spec.name());
+    if (!known) {
+      existingNetworks.add(spec);
+    }
+    return !known;
+  }
+
+  @Override
+  public List<Network> networks() {
+    return List.copyOf(existingNetworks);
+  }
+
+  @Override
+  public void connect(String network, String container, String alias) {
+    calls.add("connect:" + network + ":" + container + ":" + alias);
+    connections.add(network + ":" + container + ":" + alias);
+  }
+
+  @Override
+  public void disconnect(String network, String container) {
+    calls.add("disconnect:" + network + ":" + container);
+    disconnections.add(network + ":" + container);
+  }
+
+  @Override
+  public List<Endpoint> hubContainers(String environmentId) {
+    return List.copyOf(hubs);
+  }
+
+  @Override
+  public List<Endpoint> singletonContainers() {
+    return List.copyOf(singletons);
   }
 
   @Override
@@ -149,8 +237,9 @@ public class FakeDeploymentDriver implements DeploymentDriver {
   }
 
   @Override
-  public List<Holder> aliasHolders(String network, String alias) {
+  public List<Holder> aliasHolders(List<String> networks, String alias) {
     calls.add("aliasHolders:" + alias);
+    aliasSearches.add(String.join(",", networks));
     return nextHolders;
   }
 

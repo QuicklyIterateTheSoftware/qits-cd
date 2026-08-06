@@ -6,6 +6,7 @@ components:
   schemas:
     ApplicationSpec:
       type: object
+      deprecated: true
       required:
       - repoId
       - name
@@ -26,6 +27,16 @@ components:
         repoId:
           type: string
         name:
+          type: string
+        environmentId:
+          type: string
+        environmentName:
+          type: string
+        target:
+          $ref: "#/components/schemas/CdDeploymentTarget"
+        availableOnEnv:
+          type: boolean
+        branch:
           type: string
         healthPath:
           type: string
@@ -63,6 +74,11 @@ components:
       - IMAGE_MISSING
       - FAILED
       - DECOMMISSIONED
+    CdDeploymentTarget:
+      type: string
+      enum:
+      - ENVIRONMENT
+      - SINGLETON
     CdEnvironmentDto:
       type: object
       properties:
@@ -93,7 +109,6 @@ components:
       type: object
       required:
       - name
-      - applications
       properties:
         name:
           type: string
@@ -104,6 +119,7 @@ components:
           type: string
         applications:
           type: array
+          deprecated: true
           items:
             $ref: "#/components/schemas/ApplicationSpec"
     EnvironmentResponse:
@@ -116,6 +132,13 @@ components:
       format: date-time
       examples:
       - 2022-03-10T16:15:50Z
+    ListApplicationsResponse:
+      type: object
+      properties:
+        applications:
+          type: array
+          items:
+            $ref: "#/components/schemas/CdApplicationDto"
     ListDeploymentsResponse:
       type: object
       properties:
@@ -137,12 +160,31 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/CdPinDto"
+    UpdateEnvironmentRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        branch:
+          type: string
   securitySchemes:
     SecurityScheme:
       type: openIdConnect
       openIdConnectUrl: http://qits-idp:8080/idp/.well-known/openid-configuration
       description: Authentication
 paths:
+  /cd/api/applications:
+    get:
+      summary: Every application cd deploys — environment applications and singletons
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListApplicationsResponse"
+      tags:
+      - Cd Application Controller
   /cd/api/deployments:
     get:
       summary: "An environment's recorded deployments, newest-first"
@@ -192,6 +234,35 @@ paths:
       tags:
       - Cd Environment Controller
   /cd/api/environments/{environmentId}:
+    patch:
+      summary: Rename an environment or point it at another branch
+      parameters:
+      - name: environmentId
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateEnvironmentRequest"
+        required: true
+      responses:
+        "200":
+          description: The updated environment
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvironmentResponse"
+        "400":
+          description: A name or branch failed validation
+        "404":
+          description: No such environment
+        "409":
+          description: Another environment already has that name
+      tags:
+      - Cd Environment Controller
     get:
       summary: One environment with the applications it tracks
       parameters:
