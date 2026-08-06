@@ -1,2 +1,0 @@
-# The deployer is platform-plane: one instance for the whole host, not one per environment.
-deployment_target: singleton

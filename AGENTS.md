@@ -120,8 +120,10 @@ brought up to date from it. Three consequences worth holding on to:
   name, which is worse than a recorded failure and much harder to see.
 - `deployment_target: singleton` **converts** the repository's environment-scoped rows — their
   deployments move onto the singleton, the active ones decommissioned, the old rows go. That
-  conversion is a one-time live migration (idp and cd) and the reason it moves rather than deletes
-  is `sweepInFlight`: a `STARTING` self-update row must survive cd's own conversion.
+  conversion is a one-time live migration (qits-idp, today's only deployed singleton; the planned
+  qits-serviceregistry joins it later — cd is an ordinary environment application) and the reason it
+  moves rather than deletes is `sweepInFlight`: a `STARTING` self-update row must survive a
+  converting deployment.
 - **The conversion runs one way only.** A repository that is already a singleton and whose spec goes
   back to `environment` is REFUSED, with a `FAILED` row on the singleton naming the flip and an
   ERROR log — not converted. There is no answer to which of the environments tracking the branch

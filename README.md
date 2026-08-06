@@ -52,11 +52,14 @@ and the line.
 - `deployment_target: singleton` — one instance for the whole platform, deployed from its own
   branch. Registering as one **converts** whatever environment-scoped rows the repository had: their
   deployment history moves onto the singleton, the active ones decommissioned, and the old rows go.
-  qits-idp and qits-cd are the singletons — an identity provider each tier mints its own tokens
-  from, or a deployer that deploys only its own tier, would be a different platform. The conversion
-  is one-way: a singleton whose file goes back to `environment` is refused with a `FAILED` row
-  naming the flip, because there is no one environment to inherit its history and the environment
-  deployment would remove the running singleton on its way in. Retiring a singleton is deliberate.
+  qits-idp is today's only deployed singleton — an identity provider each tier mints its own tokens
+  from would be a different platform; the planned qits-serviceregistry joins it when that leg
+  lands. cd is not one: it is an ordinary environment application, so
+  every tier runs its own deployer, deployed from that tier's branch (today the only tier is dev).
+  The conversion is one-way: a singleton whose file goes back to `environment` is refused with a
+  `FAILED` row naming the flip, because there is no one environment to inherit its history and the
+  environment deployment would remove the running singleton on its way in. Retiring a singleton is
+  deliberate.
 - No environment listens to the branch and it is not a matching singleton ⇒ 202 and nothing, which
   is the normal case for most pushes.
 
@@ -83,8 +86,9 @@ what makes the move onto per-application networks safe: a container that holds i
 `qits-net` alone is still the predecessor, so no deploy ever starts a second copy beside it.
 
 **Self-update is a handoff**, because the one predecessor cd never stops in-process is its own
-container — and cd is itself a singleton, so this is the path its every release takes. Deploying `qits-cd` splits the cutover three ways: this instance starts the successor
-(which retries on the H2 lock under its restart policy) and launches a detached **referee** — a
+container — cd deploys itself like any other application of its environment, so this is the path
+its every release takes. Deploying `qits-cd` splits the cutover three ways: this instance starts
+the successor (which retries on the H2 lock under its restart policy) and launches a detached **referee** — a
 `--rm` container of the deployment's own image with the entrypoint swapped for the shell — then
 returns with the row left `STARTING`. The referee stops the predecessor (freeing the lock),
 waits up to the health timeout for the successor's gate, and removes whichever side lost — on
@@ -122,7 +126,7 @@ neither instance referees its own succession.
   reaches the gateway and how the gateway proxies every application. All cross-application traffic
   is meant to flow app → gateway → the target's public API. A **singleton joins every
   per-application network of every environment**, which is what makes it locally reachable
-  everywhere and is why idp and cd need no gateway route for intra-platform callers.
+  everywhere and is why idp needs no gateway route for intra-platform callers.
 
   Two environments' stacks still cannot resolve each other's aliases — the documented
   two-stacks-collide-on-`qits-net` failure — and now neither can two applications of one
@@ -297,6 +301,9 @@ does this, for the same reason.
 
 ## What is deliberately not here
 
+- **Staying the platform's registry.** The environment and application registry that lives here
+  today is planned to extract into a new `qits-serviceregistry` service — a singleton of its own —
+  in a later leg.
 - **Building or publishing images.** cd consumes the OCI registry; producing for it is the
   publisher's story. A green build with no image is `IMAGE_MISSING`, loudly.
 - **DNS wiring.** qits-dns's plan names cd as the caller that will wire
