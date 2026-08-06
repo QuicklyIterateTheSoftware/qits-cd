@@ -1,9 +1,14 @@
 package eu.wohlben.qits.cd.api;
 
 import static io.restassured.RestAssured.given;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import eu.wohlben.qits.cd.entity.CdDeploymentTarget;
+import eu.wohlben.qits.cd.registry.StubRegistry;
+import io.quarkus.test.common.TestResourceScope;
+import io.quarkus.test.common.WithTestResource;
 import io.quarkus.test.junit.QuarkusIntegrationTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
@@ -11,7 +16,6 @@ import io.restassured.http.ContentType;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
-import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 
@@ -54,6 +58,7 @@ import org.junit.jupiter.api.Test;
  * even when docker is unreachable) and keeps this IT free of host side effects.
  */
 @QuarkusIntegrationTest
+@WithTestResource(value = StubRegistry.class, scope = TestResourceScope.GLOBAL)
 @TestProfile(CdPackagedSurfaceIT.PackagedUnderTarget.class)
 public class CdPackagedSurfaceIT {
 
@@ -187,13 +192,13 @@ public class CdPackagedSurfaceIT {
   }
 
   @Test
-  public void anEnvironmentRoundTripsThroughFlywayAndPanache() {
+  public void anEnvironmentRoundTripsThroughTheRegistryProxy() {
+    // Environments are qits-serviceregistry's rows now, so what this proves in a PACKAGED process
+    // is the client: the built artifact really carries a working outbound call, on the path and in
+    // the envelope the registry publishes.
     given()
         .contentType(ContentType.JSON)
-        .body(
-            Map.of(
-                "name", "packaged-env",
-                "applications", List.of(Map.of("repoId", "packaged-repo", "name", "packaged-app"))))
+        .body(Map.of("name", "packaged-env"))
         .when()
         .post("/cd/api/environments")
         .then()
@@ -203,36 +208,39 @@ public class CdPackagedSurfaceIT {
         .when()
         .get("/cd/api/environments")
         .then()
-        .statusCode(200);
-
-    // The round trip above would look identical against an in-memory database, so pin that the
-    // process really opened the ${user.home}-rooted file H2 the cd jar ships.
-    assertTrue(
-        Files.isDirectory(PackagedUnderTarget.HOME.resolve(".qits/data/cd/h2")),
-        "the shipped file-H2 default must be what the packaged process opened");
+        .statusCode(200)
+        .body("environments.name", org.hamcrest.Matchers.hasItem("packaged-env"));
   }
 
   @Test
   public void theIntakeRecordsTheRunIdAgainstTheShippedSchema() {
-    // V2 added cd_deployment.run_id, and a migration that did not make it into the artifact shows
-    // up exactly here: the intake's insert is the first write that names the column. No docker is
-    // needed — the row is created QUEUED by the request thread, and the worker's pull against a
-    // runtime that does not exist only decides how the row ENDS, not whether it carries the run.
+    // V2 added cd_deployment.run_id and V5 added application_name/environment_id/seq; a migration
+    // that did not make it into the artifact shows up exactly here, because the intake's insert is
+    // the first write that names any of them. No docker is needed — the worker's pull against a
+    // runtime that does not exist only decides how the row ENDS, not whether it was written.
     String environmentId =
         given()
             .contentType(ContentType.JSON)
-            .body(
-                Map.of(
-                    "name", "packaged-runid",
-                    "branch", "main",
-                    "applications",
-                        List.of(Map.of("repoId", "packaged-runid-repo", "name", "packaged-runid-app"))))
+            .body(Map.of("name", "packaged-runid", "branch", "main"))
             .when()
             .post("/cd/api/environments")
             .then()
             .statusCode(201)
             .extract()
             .path("environment.id");
+
+    // This process has no git host, so the spec read fails and resolution falls back to what the
+    // registry already holds — which is exactly the path a real outage takes, and the only one that
+    // reaches a row here.
+    StubRegistry.seedService(
+        new StubRegistry.Svc(
+            "packaged-runid-repo",
+            CdDeploymentTarget.ENVIRONMENT,
+            null,
+            false,
+            null,
+            java.util.List.of(environmentId),
+            java.time.Instant.now()));
 
     given()
         .contentType(ContentType.JSON)
@@ -247,12 +255,35 @@ public class CdPackagedSurfaceIT {
         .then()
         .statusCode(202);
 
-    given()
-        .when()
-        .get("/cd/api/deployments?environmentId=" + environmentId)
-        .then()
-        .statusCode(200)
-        .body("deployments[0].runId", org.hamcrest.Matchers.equalTo("6f31a0c4-1c2b-4f7a-9b03-2ee45c1f8d61"));
+    // The whole event runs on cd's worker, registration included, so the row appears a moment after
+    // the 202 rather than during it.
+    long deadline = System.currentTimeMillis() + 30_000;
+    String runId = null;
+    while (runId == null && System.currentTimeMillis() < deadline) {
+      runId =
+          given()
+              .when()
+              .get("/cd/api/deployments?environmentId=" + environmentId)
+              .then()
+              .statusCode(200)
+              .extract()
+              .path("deployments[0].runId");
+      if (runId == null) {
+        try {
+          Thread.sleep(100);
+        } catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+        }
+      }
+    }
+    assertEquals("6f31a0c4-1c2b-4f7a-9b03-2ee45c1f8d61", runId);
+
+    // The row above would look identical against an in-memory database, so pin that the process
+    // really opened the ${user.home}-rooted file H2 the cd jar ships. cd_deployment is the only
+    // table left that a request writes, which is what makes this the place for the claim.
+    assertTrue(
+        Files.isDirectory(PackagedUnderTarget.HOME.resolve(".qits/data/cd/h2")),
+        "the shipped file-H2 default must be what the packaged process opened");
   }
 
   private static void deleteRecursively(Path root) {

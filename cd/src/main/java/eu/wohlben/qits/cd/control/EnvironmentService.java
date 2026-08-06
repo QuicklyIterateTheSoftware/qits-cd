@@ -1,23 +1,19 @@
 package eu.wohlben.qits.cd.control;
 
-import eu.wohlben.qits.cd.entity.CdApplication;
-import eu.wohlben.qits.cd.entity.CdEnvironment;
-import eu.wohlben.qits.cd.error.ConflictException;
-import eu.wohlben.qits.cd.error.NotFoundException;
-import eu.wohlben.qits.cd.persistence.CdApplicationRepository;
+import eu.wohlben.qits.cd.control.RegistryClient.RegEnvironment;
+import eu.wohlben.qits.cd.control.RegistryClient.RegService;
+import eu.wohlben.qits.cd.entity.CdDeploymentTarget;
 import eu.wohlben.qits.cd.persistence.CdDeploymentRepository;
-import eu.wohlben.qits.cd.persistence.CdEnvironmentRepository;
 import io.quarkus.narayana.jta.QuarkusTransaction;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
-import java.time.Instant;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.UUID;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
@@ -25,20 +21,21 @@ import org.jboss.logging.Logger;
  * Environment lifecycle: creation with the conventions filled in (branch {@code
  * environment/<name>}, bundle network {@code qits-env-<name>}), rename/retarget, and teardown.
  *
+ * <p><b>The rows are qits-serviceregistry's; the docker is cd's.</b> Since the extraction the
+ * registry is the system of record for environments and services, and this service is the
+ * operational door onto it — the place where a create also makes a network and a delete also reaps
+ * containers, because cd is the only thing on the platform holding a docker socket. Every read and
+ * every row write here is a proxied call; the request and response shapes did not change, which is
+ * what keeps the bootstrap and qits-spa-cd working across the switch.
+ *
  * <p>An environment is a <b>tier</b> and is created deliberately — nothing derives one. What is
  * derived is everything inside it: a green build on the environment's branch registers the
- * repository's application here ({@link DeployService}), so this service creates the tier and the
- * builds fill it.
+ * repository's service in the registry ({@link DeployService}), so this service creates the tier and
+ * the builds fill it.
  *
- * <p>The docker side of create and delete is best-effort and happens <b>after</b> the transaction:
- * an environment whose network could not be created yet is still an environment (the driver
- * re-ensures every network before every deployment), and a teardown must not roll back the delete
- * because a container was already gone. The rows are the truth; docker is made to match it.
- *
- * <p>Transactions are programmatic ({@link QuarkusTransaction#requiringNew()}, the ci stance)
- * rather than {@code @Transactional} — partly for symmetry with the worker in {@link
- * DeployService}, which has no request context, and partly because the bracket then cannot be lost
- * to a self-invocation that never crosses the interceptor.
+ * <p>Validation stays <b>here</b>, in front of the proxy. These names become docker network names,
+ * network aliases and image path segments, so cd owes an attacker-reachable surface its own check
+ * rather than borrowing another service's — and the registry ships the same vocabulary anyway.
  */
 @ApplicationScoped
 public class EnvironmentService {
@@ -55,8 +52,7 @@ public class EnvironmentService {
   /** The per-environment bundle network when the creator names none. */
   public static final String NETWORK_PREFIX = CdNetworks.BUNDLE_PREFIX;
 
-  @Inject CdEnvironmentRepository environments;
-  @Inject CdApplicationRepository applications;
+  @Inject RegistryClient registry;
   @Inject CdDeploymentRepository deployments;
   @Inject DeploymentDriver driver;
 
@@ -71,19 +67,14 @@ public class EnvironmentService {
   Optional<String> legacyNetwork;
 
   /**
-   * One application of a creation request.
+   * Create the tier in the registry, then make sure its network exists.
    *
-   * @deprecated applications are derived from the repository's {@code deployments.yml} on every
-   *     green build; naming them at creation only pre-creates rows the next build would create
-   *     anyway. Accepted so an older bootstrap keeps working.
+   * <p>The docker half is best-effort and happens <b>after</b> the row: an environment whose network
+   * could not be created yet is still an environment (the driver re-ensures every network before
+   * every deployment), so a momentarily unreachable docker must not make the create fail. That was
+   * true when the row was local and is unchanged now that it is a proxied call.
    */
-  @Deprecated
-  public record ApplicationSpec(String repoId, String name, String healthPath) {}
-
-  /** {@code apps} may be null — the shape every caller should send. */
-  public CdEnvironment create(
-      String name, String branch, String network, List<ApplicationSpec> apps) {
-    List<ApplicationSpec> declared = apps == null ? List.of() : apps;
+  public RegEnvironment create(String name, String branch, String network) {
     CdIdentifiers.requireName(name, "environment name");
     String effectiveBranch =
         CdIdentifiers.requireBranch(isBlank(branch) ? BRANCH_PREFIX + name : branch);
@@ -91,50 +82,12 @@ public class EnvironmentService {
         isBlank(network)
             ? CdNetworks.bundle(name)
             : CdIdentifiers.requireName(network, "network name");
-    Set<String> seenNames = new HashSet<>();
-    for (ApplicationSpec app : declared) {
-      CdIdentifiers.requireRepoId(app.repoId());
-      CdIdentifiers.requireName(app.name(), "application name");
-      if (app.healthPath() != null) {
-        CdIdentifiers.requireHealthPath(app.healthPath());
-      }
-      if (!seenNames.add(app.name())) {
-        throw new ConflictException("Duplicate application name: " + app.name());
-      }
-    }
 
-    CdEnvironment environment =
-        QuarkusTransaction.requiringNew()
-            .call(
-                () -> {
-                  if (environments.findByName(name).isPresent()) {
-                    throw new ConflictException("Environment already exists: " + name);
-                  }
-                  CdEnvironment env = new CdEnvironment();
-                  env.id = UUID.randomUUID().toString();
-                  env.name = name;
-                  env.branch = effectiveBranch;
-                  env.network = effectiveNetwork;
-                  env.createdAt = Instant.now();
-                  environments.persist(env);
-                  for (ApplicationSpec app : declared) {
-                    CdApplication application = new CdApplication();
-                    application.id = UUID.randomUUID().toString();
-                    application.environment = env;
-                    application.repoId = app.repoId();
-                    application.name = app.name();
-                    application.healthPath = app.healthPath();
-                    application.createdAt = Instant.now();
-                    applications.persist(application);
-                  }
-                  return env;
-                });
-    // After the commit, best-effort: a deployment re-ensures the network anyway, and an
-    // environment must not fail to exist because docker is momentarily unreachable.
+    RegEnvironment environment = registry.createEnvironment(name, effectiveBranch, effectiveNetwork);
     driver.ensureNetwork(
         new DeploymentDriver.Network(
-            environment.network,
-            environment.id,
+            environment.network(),
+            environment.id(),
             DeploymentDriver.NetworkKind.BUNDLE,
             null));
     return environment;
@@ -151,36 +104,31 @@ public class EnvironmentService {
    * ({@code qits-env-<env>-<app>}); the running containers keep the networks they are on until
    * their own next deploy moves them.
    */
-  public CdEnvironment update(String environmentId, String name, String branch) {
+  public RegEnvironment update(String environmentId, String name, String branch) {
     String newName = isBlank(name) ? null : CdIdentifiers.requireName(name, "environment name");
     String newBranch = isBlank(branch) ? null : CdIdentifiers.requireBranch(branch);
-    return QuarkusTransaction.requiringNew()
-        .call(
-            () -> {
-              CdEnvironment environment = require(environmentId);
-              if (newName != null && !newName.equals(environment.name)) {
-                if (environments.findByName(newName).isPresent()) {
-                  throw new ConflictException("Environment already exists: " + newName);
-                }
-                environment.name = newName;
-              }
-              if (newBranch != null) {
-                environment.branch = newBranch;
-              }
-              return environment;
-            });
+    return registry.updateEnvironment(environmentId, newName, newBranch);
   }
 
   /**
-   * Tear the environment down: rows first (the truth), then the containers and the networks,
-   * best-effort — a teardown must succeed even when docker already lost the containers.
+   * Tear the environment down: cd's own deployment rows, then the containers and the networks, then
+   * the tier itself in the registry.
    *
-   * <p>The order between the last two steps is load-bearing. Singletons live on this environment's
-   * per-application networks without belonging to the environment, so they survive the container
-   * reap and would then hold every network open — docker refuses to remove a network with an
-   * endpoint on it. They are disconnected first, and only the networks THIS environment owns (its
-   * bundle plus everything labelled with its id) are removed, so a singleton keeps every other
-   * environment it serves.
+   * <p><b>Docker first, the registry last</b>, and the order is the contract. The teardown is
+   * label-driven — it reaps by {@code qits.cd.environment} and removes the networks carrying that
+   * id — so it needs nothing from the registry, but a registry delete that went first would leave a
+   * failed teardown with no row to retry it from. Deleting last means a half-finished teardown is
+   * still addressable.
+   *
+   * <p>The docker half is best-effort otherwise: a teardown must succeed even when docker already
+   * lost the containers.
+   *
+   * <p>The order between the container reap and the network removal is load-bearing too. Singletons
+   * live on this environment's per-application networks without belonging to the environment, so
+   * they survive the reap and would then hold every network open — docker refuses to remove a
+   * network with an endpoint on it. They are disconnected first, and only the networks THIS
+   * environment owns (its bundle plus everything labelled with its id) are removed, so a singleton
+   * keeps every other environment it serves.
    *
    * <p><b>The legacy network is never one of them.</b> An environment may have been created with
    * {@code qits.cd.legacy-network} as its bundle — the dev tier IS that case, its bundle is
@@ -191,10 +139,10 @@ public class EnvironmentService {
    * networks still go.
    */
   public void delete(String environmentId) {
-    CdEnvironment environment = require(environmentId);
+    RegEnvironment environment = registry.environment(environmentId);
     String legacy = legacyNetwork.map(String::strip).filter(n -> !n.isEmpty()).orElse(null);
     Set<String> networks = new LinkedHashSet<>();
-    networks.add(environment.network);
+    networks.add(environment.network());
     for (DeploymentDriver.Network network : driver.networks()) {
       if (environmentId.equals(network.environmentId())) {
         networks.add(network.name());
@@ -203,15 +151,11 @@ public class EnvironmentService {
     if (networks.remove(legacy)) {
       LOG.infof(
           "Environment %s was on the legacy network '%s' — left in place, it is the platform's",
-          environment.name, legacy);
+          environment.name(), legacy);
     }
+
     QuarkusTransaction.requiringNew()
-        .run(
-            () -> {
-              deployments.delete("application.environment.id = ?1", environmentId);
-              applications.delete("environment.id = ?1", environmentId);
-              environments.deleteById(environmentId);
-            });
+        .run(() -> deployments.delete("environmentId = ?1", environmentId));
     int removed = driver.removeEnvironmentContainers(environmentId);
     if (removed > 0) {
       LOG.infof("Removed %d container(s) of environment %s", removed, environmentId);
@@ -224,25 +168,68 @@ public class EnvironmentService {
     for (String network : networks) {
       driver.removeNetwork(network);
     }
+
+    registry.deleteEnvironment(environmentId);
   }
 
-  public CdEnvironment require(String environmentId) {
-    return environments
-        .findByIdOptional(environmentId)
-        .orElseThrow(() -> new NotFoundException("No such environment: " + environmentId));
+  public RegEnvironment require(String environmentId) {
+    return registry.environment(environmentId);
   }
 
-  public List<CdEnvironment> list() {
-    return environments.listNewestFirst();
+  public List<RegEnvironment> list() {
+    return registry.environments();
   }
 
-  public List<CdApplication> applicationsOf(String environmentId) {
-    return applications.listByEnvironment(environmentId);
+  /**
+   * One application as cd's read surface reports it: a registry service flattened into one tier.
+   * {@code environmentId} and {@code environmentName} are null exactly for a singleton, and for an
+   * environment service the registry currently links nowhere.
+   */
+  public record ApplicationView(RegService service, String environmentId, String environmentName) {}
+
+  /**
+   * The applications of one environment, as the environment's own read has always answered it:
+   * the tier's services, <b>without</b> the singletons.
+   *
+   * <p>The registry's links query returns both — a cd asking "what must be linked into my
+   * environment" needs the singletons too — but this is the environment aggregate, and a singleton
+   * belongs to no tier. Singletons are reached through the flat listing, which is why that listing
+   * exists.
+   */
+  public List<ApplicationView> applicationsOf(RegEnvironment environment) {
+    List<ApplicationView> scoped = new ArrayList<>();
+    for (RegService service : registry.linksOf(environment.id())) {
+      if (service.target() != CdDeploymentTarget.SINGLETON) {
+        scoped.add(new ApplicationView(service, environment.id(), environment.name()));
+      }
+    }
+    return List.copyOf(scoped);
   }
 
-  /** Every application row: the environments' and the singletons', for the registry view. */
-  public List<CdApplication> allApplications() {
-    return new ArrayList<>(applications.listAll());
+  /**
+   * Every application cd deploys, flat: one row per environment link, one row per singleton.
+   *
+   * <p>Flat because a singleton belongs to no environment — reading the registry through the
+   * environments would leave qits-idp and qits-serviceregistry out of it, which are the two a reader
+   * most wants to find.
+   */
+  public List<ApplicationView> allApplications() {
+    Map<String, String> environmentNames = new LinkedHashMap<>();
+    for (RegEnvironment environment : registry.environments()) {
+      environmentNames.put(environment.id(), environment.name());
+    }
+    List<ApplicationView> views = new ArrayList<>();
+    for (RegService service : registry.services()) {
+      if (service.target() == CdDeploymentTarget.SINGLETON || service.environmentIds().isEmpty()) {
+        views.add(new ApplicationView(service, null, null));
+        continue;
+      }
+      for (String environmentId : service.environmentIds()) {
+        views.add(
+            new ApplicationView(service, environmentId, environmentNames.get(environmentId)));
+      }
+    }
+    return List.copyOf(views);
   }
 
   private static boolean isBlank(String value) {

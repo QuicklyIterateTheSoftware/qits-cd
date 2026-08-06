@@ -8,13 +8,12 @@ import jakarta.persistence.Table;
 import java.time.Instant;
 
 /**
- * One deployment environment — a <b>tier</b>: dev, preprod, prod. A name, the branch whose green
- * builds deploy into it, and the docker network its public nodes share. Created deliberately over
- * the environment surface; a tier is not something a build invents.
+ * One deployment environment — a <b>tier</b>: dev, preprod, prod.
  *
- * <p>The applications it holds are {@link CdApplication} rows, and those are <b>derived</b>: a
- * green build on {@link #branch} registers or updates the repository's application here. Nothing
- * declares them over the API.
+ * <p><b>FROZEN.</b> qits-serviceregistry owns environments since the extraction; the environment
+ * surface on this service proxies to it. These rows are cd v1's, kept for one release so the
+ * one-time export ({@code RegistryExport}) can be repeated or audited, and read by nothing else.
+ * A later cleanup migration drops this table and {@code cd_application} together.
  */
 @Entity
 @Table(name = "cd_environment")

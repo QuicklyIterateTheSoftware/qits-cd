@@ -2,6 +2,9 @@ package eu.wohlben.qits.cd.telemetry;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import eu.wohlben.qits.cd.registry.StubRegistry;
+import io.quarkus.test.common.TestResourceScope;
+import io.quarkus.test.common.WithTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import org.eclipse.microprofile.config.Config;
 import org.eclipse.microprofile.config.ConfigProvider;
@@ -25,6 +28,7 @@ import org.junit.jupiter.api.Test;
  * inherits rather than shadowing, so this is the shipped config under test.
  */
 @QuarkusTest
+@WithTestResource(value = StubRegistry.class, scope = TestResourceScope.GLOBAL)
 class OtelLogConfigTest {
 
   private static String value(String key) {

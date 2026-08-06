@@ -79,19 +79,28 @@ public class RollbackPins {
   /**
    * One deployment row reduced to what the rule reads. Grouped by {@code applicationId} and
    * reported by {@code applicationName}: the id is what makes an environment's history its own, the
-   * name is what a pin addresses.
+   * name is what a pin addresses. Since the extraction the id is derived from the row's own
+   * {@code (environmentId, applicationName)} pair ({@link CdApplicationKeys}) rather than read off
+   * an application row — same grouping, no registry involved.
    */
   public record Row(
       String applicationId, String applicationName, String commitSha, CdDeploymentStatus status) {}
 
-  /** The pins over every environment this instance knows. */
+  /**
+   * The pins over every environment this instance knows, <b>from cd's own deployment rows alone</b>.
+   *
+   * <p>That independence is the point rather than an accident: qits-artifacts' image GC reads this
+   * fail-closed and deletes nothing when cd cannot answer, so a pin that needed qits-serviceregistry
+   * would make a registry outage stop garbage collection across the platform. Everything the rule
+   * reads — the application name, the tier, the sha, the status — is on the deployment row.
+   */
   public List<Pin> pins() {
     List<Row> rows = new ArrayList<>();
     for (CdDeployment deployment : deployments.listAllNewestFirst()) {
       rows.add(
           new Row(
-              deployment.application.id,
-              deployment.application.name,
+              CdApplicationKeys.of(deployment.environmentId, deployment.applicationName),
+              deployment.applicationName,
               deployment.commitSha,
               deployment.status));
     }

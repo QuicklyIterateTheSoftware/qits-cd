@@ -1,14 +1,13 @@
 package eu.wohlben.qits.cd.control;
 
 import eu.wohlben.qits.cd.control.CdSpecSource.DeploymentSpec;
-import eu.wohlben.qits.cd.entity.CdApplication;
+import eu.wohlben.qits.cd.control.RegistryClient.RegEnvironment;
+import eu.wohlben.qits.cd.control.RegistryClient.RegService;
+import eu.wohlben.qits.cd.control.RegistryClient.ServiceUpsert;
 import eu.wohlben.qits.cd.entity.CdDeployment;
 import eu.wohlben.qits.cd.entity.CdDeploymentStatus;
 import eu.wohlben.qits.cd.entity.CdDeploymentTarget;
-import eu.wohlben.qits.cd.entity.CdEnvironment;
-import eu.wohlben.qits.cd.persistence.CdApplicationRepository;
 import eu.wohlben.qits.cd.persistence.CdDeploymentRepository;
-import eu.wohlben.qits.cd.persistence.CdEnvironmentRepository;
 import io.quarkus.narayana.jta.QuarkusTransaction;
 import io.quarkus.runtime.LaunchMode;
 import io.quarkus.runtime.StartupEvent;
@@ -31,21 +30,29 @@ import org.jboss.logging.Logger;
 
 /**
  * The deployment orchestrator: a build-succeeded event → the repository's deployment spec at that
- * commit → the applications that spec addresses → one recorded deployment each, driven pull → run →
+ * commit → the environments that spec addresses → one recorded deployment each, driven pull → run →
  * join → health gate → cutover on a single-threaded daemon worker (the intake returns immediately;
  * deployments across all environments are serialized — parallelism is an explicit follow-up, and
  * serial is what makes "the previous ACTIVE deployment" an uncontended read).
  *
- * <p><b>Registration is derived.</b> Nothing declares an application over the API. A green build
- * carries cd to {@code .config/qits/deployments.yml} in the repository at that sha, and the row is
- * created or brought up to date from it: an {@code environment} target registers into every
- * environment whose branch matches, a {@code singleton} target registers once for the whole
- * platform if the build is on the singleton's own branch. A repository with no such file gets the
- * defaults and behaves exactly as it did before the file existed.
+ * <p><b>Registration is derived, and it writes to qits-serviceregistry.</b> Nothing declares an
+ * application over the API. A green build carries cd to {@code .config/qits/deployments.yml} in the
+ * repository at that sha, and the registry's service row is created or brought up to date from it:
+ * an {@code environment} target is linked into every environment whose branch matches, a {@code
+ * singleton} target keeps no links at all and deploys once for the platform if the build is on its
+ * own branch. A repository with no such file gets the defaults and behaves exactly as it did before
+ * the file existed. Only the <b>deployment rows</b> are cd's own.
+ *
+ * <p><b>An unreachable registry is a recorded failure, never a guess</b> — the posture the spec
+ * read already had. cd cannot know which tiers track a branch without it, so it falls back to the
+ * tiers this application has deployed into before (its own rows say that much) and writes a {@code
+ * FAILED} deployment naming the cause into each. A repository with no history gets nothing, exactly
+ * as an unknown repository always has. Startup does not touch the registry at all: cd boots clean
+ * while it is down.
  *
  * <p>Each DB transition sits in its own {@link QuarkusTransaction#requiringNew()} bracket so the
- * slow docker work never holds a transaction, and everything the docker calls need is copied out
- * of the entities first — the worker thread has no request context and no open session.
+ * slow docker work never holds a transaction, and everything the docker calls need is copied into a
+ * plain {@link Plan} first — the worker thread has no request context and no open session.
  *
  * <p><b>The cutover invariant:</b> the previous container is only <i>stopped</i> during the gate
  * and is removed only after the new one passed it; a failed deployment — image missing, docker
@@ -53,26 +60,25 @@ import org.jboss.logging.Logger;
  * the previous deployment stays {@code ACTIVE} and serving. Stop-before-start (rather than the
  * overlapping cutover this service first shipped) is what makes stateful applications deployable
  * at all: one process per H2 file, one binder per published host port. The pull still happens
- * before the stop, so replacing the registry's own application does not depend on the registry
- * being up mid-cutover. The predecessor is whatever holds the application's alias on any of the
- * networks the fresh container is about to be on — including containers cd did not start (a
- * bootstrap's seeded originals) and containers still living on the legacy network alone, which is
- * how the platform migrates onto per-application networks without ever running two copies. The one
- * predecessor cd never stops in-process is its own container: deploying cd itself takes the
- * handoff path — start the successor, launch the detached referee that stops this instance and
- * arbitrates the gate, and let the surviving instance record the outcome (the successor's sweep
- * adopts the row; a rolled-back predecessor's sweep fails it).
+ * before the stop, so replacing the OCI registry's own application does not depend on it being up
+ * mid-cutover. The predecessor is whatever holds the application's alias on any of the networks the
+ * fresh container is about to be on — including containers cd did not start (a bootstrap's seeded
+ * originals) and containers still living on the legacy network alone, which is how the platform
+ * migrates onto per-application networks without ever running two copies. The one predecessor cd
+ * never stops in-process is its own container: deploying cd itself takes the handoff path — start
+ * the successor, launch the detached referee that stops this instance and arbitrates the gate, and
+ * let the surviving instance record the outcome (the successor's sweep adopts the row; a rolled-back
+ * predecessor's sweep fails it).
  */
 @ApplicationScoped
 public class DeployService {
 
   private static final Logger LOG = Logger.getLogger(DeployService.class);
 
-  @Inject CdApplicationRepository applications;
-  @Inject CdEnvironmentRepository environments;
   @Inject CdDeploymentRepository deployments;
   @Inject DeploymentDriver driver;
   @Inject CdSpecSource specs;
+  @Inject RegistryClient registry;
 
   @ConfigProperty(name = "qits.artifacts.registry-host")
   String registryHost;
@@ -122,6 +128,9 @@ public class DeployService {
    * handoff records its outcome. The containers are deliberately NOT reaped: a deployed
    * application outlives its deployer, and whatever was {@code ACTIVE} before the restart is
    * still serving.
+   *
+   * <p>Reads nothing but cd's own rows, which is what lets the process boot while
+   * qits-serviceregistry is down.
    */
   void onStart(@Observes StartupEvent event) {
     if (LaunchMode.current() == LaunchMode.TEST) {
@@ -151,8 +160,12 @@ public class DeployService {
                         && !self.isBlank()) {
                       String id = driver.containerId(orphan.containerName);
                       if (!id.isBlank() && (id.startsWith(self) || self.startsWith(id))) {
+                        // The prior actives of the same (application, tier) — the pair that
+                        // replaced "the same application row", and what V5 backfills onto every
+                        // row cd v1 wrote, including the STARTING one this adopts.
                         for (CdDeployment previous :
-                            deployments.listActiveByApplication(orphan.application.id)) {
+                            deployments.listActiveByApplication(
+                                orphan.applicationName, orphan.environmentId)) {
                           previous.status = CdDeploymentStatus.DECOMMISSIONED;
                           previous.finishedAt = Instant.now();
                         }
@@ -182,13 +195,12 @@ public class DeployService {
    * and returns — the sender is fire-and-forget and has nothing to do with the answer.
    *
    * <p><b>The whole event runs on the worker, registration included</b>, and that placement is the
-   * concurrency contract rather than a detail. Derived registration is a read-then-write — "is
-   * there a row for this repository yet, and if not, make one" — and a singleton row is the one
-   * shape no database constraint can guard, because its {@code environment_id} is null and a
-   * composite unique index treats nulls as distinct. Two green builds of one repository arriving
-   * together would each read "no singleton" and each write one. The worker is single-threaded, so
-   * putting the read and the write on it is what makes the pair atomic against every other event —
-   * the same reason the cutover lives there, applied to the rows instead of the containers.
+   * concurrency contract rather than a detail. Derived registration is a read-then-write — "what
+   * does the registry hold for this service, and what should it hold now" — and two green builds of
+   * one repository arriving together would each read the old state and each write a link set
+   * computed from it. The worker is single-threaded, so putting the read and the write on it is
+   * what makes the pair atomic against every other event — the same reason the cutover lives there,
+   * applied to the rows instead of the containers.
    *
    * <p>{@code runId} is optional and is recorded on every row this queues, verbatim: it is the only
    * pointer from a deployment back to the build that caused it, and cd resolves it against nothing —
@@ -211,40 +223,69 @@ public class DeployService {
   }
 
   /**
+   * One place this build deploys to: one application in one tier, or the platform singleton.
+   * Resolved from the registry before anything is queued, and carried by value from there on — the
+   * docker work must not need a second registry call to know where it is going.
+   */
+  record Target(
+      String applicationName,
+      String environmentId,
+      String environmentName,
+      String bundleNetwork,
+      CdDeploymentTarget target,
+      boolean availableOnEnv,
+      String healthPath) {}
+
+  /**
    * One build-succeeded event, start to finish, on the worker thread: read what the repository
-   * declares, bring the rows it addresses up to date, and deploy each.
+   * declares, bring the registry up to date with it, and deploy each place it addresses.
    *
-   * <p>The spec read comes first because it decides <b>which rows exist</b> — there is nothing to
+   * <p>The spec read comes first because it decides <b>which places exist</b> — there is nothing to
    * queue until it has answered. A read that fails (the git host is down, the file does not parse)
-   * does not guess: the applications already registered for this (repo, branch) each get a recorded
-   * {@code FAILED} deployment naming the cause, and a repository with no rows yet gets nothing,
-   * exactly as an unknown repository always has.
+   * does not guess: the places this (repo, branch) already deploys to each get a recorded {@code
+   * FAILED} deployment naming the cause, and a repository with nothing registered gets nothing,
+   * exactly as an unknown repository always has. A registry that cannot be reached takes the same
+   * path with its own cause.
    */
   private void deploy(String runId, String repoId, String branch, String commitSha) {
     DeploymentSpec spec = null;
-    String specFailure = null;
+    String failure = null;
     try {
       spec = specs.read(repoId, commitSha);
     } catch (RuntimeException e) {
-      specFailure = "[deployment spec unreadable: " + e.getMessage() + "]";
+      failure = "[deployment spec unreadable: " + e.getMessage() + "]";
       LOG.warnf("Could not read the deployment spec of %s@%s: %s", repoId, commitSha, e.getMessage());
     }
 
-    List<String> applicationIds =
-        spec == null
-            ? alreadyRegistered(repoId, branch)
-            : register(runId, repoId, branch, commitSha, spec);
-    List<String> queued = queue(runId, commitSha, applicationIds);
+    List<Target> targets;
+    try {
+      targets =
+          spec == null
+              ? alreadyRegistered(repoId, branch)
+              : register(runId, repoId, branch, commitSha, spec);
+    } catch (RuntimeException e) {
+      // Registry unreachable, or answering something unusable. cd cannot know which tiers track
+      // this branch, so it says so on the tiers this application is known to have deployed into
+      // and deploys nothing.
+      LOG.errorf(
+          "Could not resolve %s@%s against qits-serviceregistry: %s", repoId, branch, e.getMessage());
+      if (failure == null) {
+        failure = "[service registry unreachable: " + e.getMessage() + "]";
+      }
+      targets = lastKnownTargets(repoId);
+    }
 
-    if (specFailure != null) {
+    List<String> queued = queue(runId, commitSha, targets);
+    if (failure != null) {
       for (String deploymentId : queued) {
-        finish(deploymentId, CdDeploymentStatus.FAILED, specFailure);
+        finish(deploymentId, CdDeploymentStatus.FAILED, failure);
       }
       return;
     }
-    for (String deploymentId : queued) {
+    for (int i = 0; i < queued.size(); i++) {
+      String deploymentId = queued.get(i);
       try {
-        execute(deploymentId);
+        execute(deploymentId, targets.get(i), commitSha);
       } catch (RuntimeException e) {
         LOG.errorf(e, "Deployment %s failed unexpectedly", deploymentId);
         finish(deploymentId, CdDeploymentStatus.FAILED, "[unexpected: " + e + "]");
@@ -253,10 +294,10 @@ public class DeployService {
   }
 
   /**
-   * Bring the rows this build addresses up to date with what the repository declares, and answer
-   * which applications to deploy. The whole of derived registration.
+   * Bring the registry up to date with what the repository declares, and answer where to deploy.
+   * The whole of derived registration.
    */
-  private List<String> register(
+  private List<Target> register(
       String runId, String repoId, String branch, String commitSha, DeploymentSpec spec) {
     if (!isDeployableName(repoId)) {
       // The application name is the image path segment and the network alias, so it has to be a
@@ -265,37 +306,44 @@ public class DeployService {
       LOG.warnf("Repository %s cannot be an application name, so nothing was registered", repoId);
       return List.of();
     }
-    return QuarkusTransaction.requiringNew()
-        .call(
-            () ->
-                spec.target() == CdDeploymentTarget.SINGLETON
-                    ? registerSingleton(repoId, branch, spec)
-                    : registerInEnvironments(runId, repoId, branch, commitSha, spec));
+    Optional<RegService> known =
+        registry.services().stream().filter(s -> repoId.equals(s.name())).findFirst();
+    return spec.target() == CdDeploymentTarget.SINGLETON
+        ? registerSingleton(repoId, branch, spec, known)
+        : registerInEnvironments(runId, repoId, branch, commitSha, spec, known);
   }
 
   /**
    * The environment half. A repository that is <b>already a singleton</b> is refused here rather
    * than registered: the two planes are not symmetric, and going back is not a conversion.
    *
-   * <p>Coming the other way, environment rows become the singleton because there is exactly one
-   * destination to move them to. A singleton going back has as many destinations as there are
-   * environments tracking the branch, no answer to which of them inherits the deployment history,
-   * and a running container on {@code qits-platform} that the environment deployment would find
-   * through the legacy network and remove — leaving a singleton row that says {@code ACTIVE} about
-   * a container that no longer exists. So this refuses, loudly and on the record: an operator
-   * deletes the singleton row's plane deliberately, or the file goes back to what it said.
+   * <p>Coming the other way, environment links become the singleton because there is exactly one
+   * destination to move the history to. A singleton going back has as many destinations as there
+   * are environments tracking the branch, no answer to which of them inherits the deployment
+   * history, and a running container on {@code qits-platform} that the environment deployment would
+   * find through the legacy network and remove — leaving a singleton row that says {@code ACTIVE}
+   * about a container that no longer exists. So this refuses, loudly and on the record.
+   *
+   * <p>The link set written is the <b>union</b> of what the registry already holds and the
+   * environments this branch addresses. A green build on {@code environment/dev} says nothing about
+   * whether the service also belongs in preprod, and {@code PUT services/{name}} replaces the whole
+   * set — so sending only this branch's environments would silently unlink every other tier.
    */
-  private List<String> registerInEnvironments(
-      String runId, String repoId, String branch, String commitSha, DeploymentSpec spec) {
-    Optional<CdApplication> singleton = applications.findSingletonByRepo(repoId);
-    if (singleton.isPresent()) {
+  private List<Target> registerInEnvironments(
+      String runId,
+      String repoId,
+      String branch,
+      String commitSha,
+      DeploymentSpec spec,
+      Optional<RegService> known) {
+    if (known.filter(s -> s.target() == CdDeploymentTarget.SINGLETON).isPresent()) {
       LOG.errorf(
           "%s is registered as a platform singleton and its deployments.yml now asks for"
               + " deployment_target: environment. Going back is not a conversion and was refused —"
               + " remediate deliberately (retire the singleton, then push again).",
           repoId);
       recordRejection(
-          singleton.get(),
+          repoId,
           runId,
           commitSha,
           "[refused: "
@@ -307,139 +355,212 @@ public class DeployService {
               + " singleton deliberately, then push again.]");
       return List.of();
     }
-    List<String> ids = new ArrayList<>();
-    for (CdEnvironment environment : environments.listByBranch(branch)) {
-      CdApplication application =
-          applications
-              .findByEnvironmentAndRepo(environment.id, repoId)
-              .orElseGet(
-                  () -> {
-                    CdApplication fresh = new CdApplication();
-                    fresh.id = UUID.randomUUID().toString();
-                    fresh.environment = environment;
-                    fresh.repoId = repoId;
-                    fresh.name = repoId;
-                    fresh.createdAt = Instant.now();
-                    applications.persist(fresh);
-                    LOG.infof("Registered %s in environment %s", repoId, environment.name);
-                    return fresh;
-                  });
-      application.deploymentTarget = CdDeploymentTarget.ENVIRONMENT;
-      application.availableOnEnv = spec.availableOnEnv();
-      application.branch = null; // an environment application takes its branch from its tier
-      ids.add(application.id);
+
+    List<RegEnvironment> matching = registry.environmentsOnBranch(branch);
+    if (matching.isEmpty()) {
+      // No tier listens to this branch: the normal case for every green build on a branch without
+      // an environment. Nothing to link into, so nothing is written.
+      return List.of();
     }
-    return ids;
+
+    Set<String> links = new LinkedHashSet<>(known.map(RegService::environmentIds).orElse(List.of()));
+    for (RegEnvironment environment : matching) {
+      links.add(environment.id());
+    }
+    String healthPath = known.map(RegService::healthPath).orElse(null);
+    registry.upsertService(
+        new ServiceUpsert(
+            repoId,
+            CdDeploymentTarget.ENVIRONMENT,
+            null, // an environment application takes its branch from its tier
+            spec.availableOnEnv(),
+            healthPath,
+            List.copyOf(links)));
+
+    List<Target> targets = new ArrayList<>();
+    for (RegEnvironment environment : matching) {
+      if (known.isEmpty() || !known.get().environmentIds().contains(environment.id())) {
+        LOG.infof("Registered %s in environment %s", repoId, environment.name());
+      }
+      targets.add(
+          new Target(
+              repoId,
+              environment.id(),
+              environment.name(),
+              environment.network(),
+              CdDeploymentTarget.ENVIRONMENT,
+              spec.availableOnEnv(),
+              healthPath));
+    }
+    return List.copyOf(targets);
   }
 
   /**
    * The singleton half, including the conversion the live migration depends on: a repository that
-   * was an environment application until this commit has rows in every environment it was in, and
-   * those rows have to become the one singleton row rather than sit beside it. Their deployment
-   * history is <b>moved onto the singleton</b> — the active ones decommissioned, since the
-   * application they described is about to be replaced from a different plane — and only then are
-   * the old rows removed. Moving rather than deleting is what keeps an in-flight self-update row
-   * alive across cd's own conversion; the containers those rows started are absorbed by the next
-   * cutover, which finds them on the legacy network exactly as it finds any other predecessor.
+   * was an environment application until this commit had links in every environment it was in, and
+   * those links go rather than sit beside the singleton. Its deployment history is <b>moved onto
+   * the platform plane</b> — the active rows decommissioned, since the application they described is
+   * about to be replaced from a different plane — by clearing their environment rather than deleting
+   * them. Moving rather than deleting is what keeps an in-flight self-update row alive across cd's
+   * own conversion; the containers those rows started are absorbed by the next cutover, which finds
+   * them on the legacy network exactly as it finds any other predecessor.
+   *
+   * <p>There is no "this name already belongs to another repository" check any more, and there is
+   * nothing to check: the registry holds one identity for a service and derived registration has
+   * always named an application after its repository, so the name IS the repository.
    */
-  private List<String> registerSingleton(String repoId, String branch, DeploymentSpec spec) {
+  private List<Target> registerSingleton(
+      String repoId, String branch, DeploymentSpec spec, Optional<RegService> known) {
     if (!branch.equals(spec.singletonBranch())) {
       return List.of();
     }
-    Optional<CdApplication> nameTaken = applications.findSingletonByName(repoId);
-    if (nameTaken.isPresent() && !nameTaken.get().repoId.equals(repoId)) {
-      LOG.errorf(
-          "Singleton name %s already belongs to repository %s — %s was not registered",
-          repoId, nameTaken.get().repoId, repoId);
-      return List.of();
+    if (known.isEmpty()) {
+      LOG.infof("Registered %s as a platform singleton", repoId);
     }
-    CdApplication singleton =
-        applications
-            .findSingletonByRepo(repoId)
-            .orElseGet(
-                () -> {
-                  CdApplication fresh = new CdApplication();
-                  fresh.id = UUID.randomUUID().toString();
-                  fresh.repoId = repoId;
-                  fresh.name = repoId;
-                  fresh.createdAt = Instant.now();
-                  applications.persist(fresh);
-                  LOG.infof("Registered %s as a platform singleton", repoId);
-                  return fresh;
-                });
-    singleton.environment = null;
-    singleton.deploymentTarget = CdDeploymentTarget.SINGLETON;
-    singleton.availableOnEnv = false;
-    singleton.branch = spec.singletonBranch();
+    String healthPath = known.map(RegService::healthPath).orElse(null);
+    registry.upsertService(
+        new ServiceUpsert(
+            repoId,
+            CdDeploymentTarget.SINGLETON,
+            spec.singletonBranch(),
+            false,
+            healthPath,
+            List.of()));
 
-    for (CdApplication scoped : applications.listEnvironmentScopedByRepo(repoId)) {
-      for (CdDeployment deployment : deployments.listByApplication(scoped.id)) {
-        if (deployment.status == CdDeploymentStatus.ACTIVE) {
-          deployment.status = CdDeploymentStatus.DECOMMISSIONED;
-          deployment.finishedAt = Instant.now();
-        }
-        deployment.application = singleton;
-      }
-      deployments.flush();
-      applications.delete(scoped);
-      LOG.infof("Converted %s from an environment application to the platform singleton", repoId);
-    }
-    return List.of(singleton.id);
+    QuarkusTransaction.requiringNew()
+        .run(
+            () -> {
+              List<CdDeployment> scoped = deployments.listEnvironmentScoped(repoId);
+              for (CdDeployment deployment : scoped) {
+                if (deployment.status == CdDeploymentStatus.ACTIVE) {
+                  deployment.status = CdDeploymentStatus.DECOMMISSIONED;
+                  deployment.finishedAt = Instant.now();
+                }
+                deployment.environmentId = null;
+              }
+              if (!scoped.isEmpty()) {
+                LOG.infof(
+                    "Converted %s from an environment application to the platform singleton", repoId);
+              }
+            });
+
+    return List.of(
+        new Target(
+            repoId, null, null, null, CdDeploymentTarget.SINGLETON, false, healthPath));
   }
 
   /**
    * A refused registration, written down where the operator will look for it: one {@code FAILED}
-   * deployment on the row that already exists. A log line alone would say the same thing to nobody
-   * — the intake is fire-and-forget, so the row is the only surface a refusal can surface on.
-   * Called inside the registration transaction.
+   * deployment on the singleton's plane. A log line alone would say the same thing to nobody — the
+   * intake is fire-and-forget, so the row is the only surface a refusal can surface on.
    */
-  private void recordRejection(
-      CdApplication application, String runId, String commitSha, String detail) {
-    CdDeployment rejected = new CdDeployment();
-    rejected.id = UUID.randomUUID().toString();
-    rejected.application = application;
-    rejected.commitSha = commitSha;
-    rejected.runId = runId;
-    rejected.status = CdDeploymentStatus.FAILED;
-    rejected.detail = detail;
-    rejected.createdAt = Instant.now();
-    rejected.finishedAt = Instant.now();
-    deployments.persist(rejected);
-  }
-
-  /** What a failed spec read falls back to: the rows this (repo, branch) already had. */
-  private List<String> alreadyRegistered(String repoId, String branch) {
-    return QuarkusTransaction.requiringNew()
-        .call(
+  private void recordRejection(String applicationName, String runId, String commitSha, String detail) {
+    QuarkusTransaction.requiringNew()
+        .run(
             () -> {
-              List<String> ids = new ArrayList<>();
-              for (CdApplication application : applications.listByRepoAndBranch(repoId, branch)) {
-                ids.add(application.id);
-              }
-              applications
-                  .findSingletonByRepo(repoId)
-                  .filter(a -> branch.equals(a.branch))
-                  .ifPresent(a -> ids.add(a.id));
-              return ids;
+              CdDeployment rejected = new CdDeployment();
+              rejected.id = UUID.randomUUID().toString();
+              rejected.applicationName = applicationName;
+              rejected.environmentId = null;
+              rejected.commitSha = commitSha;
+              rejected.runId = runId;
+              rejected.status = CdDeploymentStatus.FAILED;
+              rejected.detail = detail;
+              rejected.createdAt = Instant.now();
+              rejected.finishedAt = Instant.now();
+              deployments.persist(rejected);
             });
   }
 
-  private List<String> queue(String runId, String commitSha, List<String> applicationIds) {
-    if (applicationIds.isEmpty()) {
+  /**
+   * What a failed spec read falls back to: where this (repo, branch) already deploys, read off the
+   * registry.
+   */
+  private List<Target> alreadyRegistered(String repoId, String branch) {
+    Optional<RegService> known =
+        registry.services().stream().filter(s -> repoId.equals(s.name())).findFirst();
+    if (known.isEmpty()) {
+      return List.of();
+    }
+    RegService service = known.get();
+    if (service.target() == CdDeploymentTarget.SINGLETON) {
+      return branch.equals(service.branch())
+          ? List.of(
+              new Target(
+                  repoId,
+                  null,
+                  null,
+                  null,
+                  CdDeploymentTarget.SINGLETON,
+                  false,
+                  service.healthPath()))
+          : List.of();
+    }
+    List<Target> targets = new ArrayList<>();
+    for (RegEnvironment environment : registry.environmentsOnBranch(branch)) {
+      if (service.environmentIds().contains(environment.id())) {
+        targets.add(
+            new Target(
+                repoId,
+                environment.id(),
+                environment.name(),
+                environment.network(),
+                CdDeploymentTarget.ENVIRONMENT,
+                service.availableOnEnv(),
+                service.healthPath()));
+      }
+    }
+    return List.copyOf(targets);
+  }
+
+  /**
+   * Where to record a failure when the registry itself is the failure: every {@code (application,
+   * tier)} pair this application's own deployment rows name.
+   *
+   * <p>It is deliberately not filtered by branch — without the registry cd does not know which
+   * tiers track which branch, and a recorded failure in a tier that would not have deployed is
+   * better than a silence in the tier that would have. Nothing acts on a {@code FAILED} row.
+   * A repository with no history here produces none, which is the "202 and nothing happened" shape
+   * an unknown repository has always had.
+   */
+  private List<Target> lastKnownTargets(String repoId) {
+    Set<String> seen = new LinkedHashSet<>();
+    List<Target> targets = new ArrayList<>();
+    List<CdDeployment> history =
+        QuarkusTransaction.requiringNew()
+            .call(() -> List.copyOf(deployments.listByApplicationNewestFirst(repoId)));
+    for (CdDeployment deployment : history) {
+      if (!seen.add(String.valueOf(deployment.environmentId))) {
+        continue;
+      }
+      targets.add(
+          new Target(
+              repoId,
+              deployment.environmentId,
+              null,
+              null,
+              deployment.environmentId == null
+                  ? CdDeploymentTarget.SINGLETON
+                  : CdDeploymentTarget.ENVIRONMENT,
+              false,
+              null));
+    }
+    return List.copyOf(targets);
+  }
+
+  private List<String> queue(String runId, String commitSha, List<Target> targets) {
+    if (targets.isEmpty()) {
       return List.of();
     }
     return QuarkusTransaction.requiringNew()
         .call(
             () -> {
               List<String> ids = new ArrayList<>();
-              for (String applicationId : applicationIds) {
-                CdApplication application = applications.findById(applicationId);
-                if (application == null) {
-                  continue;
-                }
+              for (Target target : targets) {
                 CdDeployment deployment = new CdDeployment();
                 deployment.id = UUID.randomUUID().toString();
-                deployment.application = application;
+                deployment.applicationName = target.applicationName();
+                deployment.environmentId = target.environmentId();
                 deployment.commitSha = commitSha;
                 deployment.runId = runId;
                 deployment.status = CdDeploymentStatus.QUEUED;
@@ -452,32 +573,42 @@ public class DeployService {
   }
 
   /** Everything a deployment needs off the worker thread — plain values, never entities. */
-  private record Plan(
-      String deploymentId,
-      String environmentId,
-      String environmentName,
-      String bundleNetwork,
-      String applicationId,
-      String applicationName,
-      String sha,
-      String healthPath,
-      CdDeploymentTarget target,
-      boolean availableOnEnv) {
+  private record Plan(String deploymentId, Target target, String sha, String healthPath) {
+
+    String applicationName() {
+      return target.applicationName();
+    }
+
+    String environmentId() {
+      return target.environmentId();
+    }
+
+    String environmentName() {
+      return target.environmentName();
+    }
+
+    String bundleNetwork() {
+      return target.bundleNetwork();
+    }
+
+    boolean availableOnEnv() {
+      return target.availableOnEnv();
+    }
 
     boolean singleton() {
-      return target == CdDeploymentTarget.SINGLETON;
+      return target.target() == CdDeploymentTarget.SINGLETON;
     }
 
     /** The one network {@code docker run} can take; every other membership is a join. */
     String primaryNetwork() {
       return singleton()
           ? CdNetworks.PLATFORM
-          : CdNetworks.application(environmentName, applicationName);
+          : CdNetworks.application(environmentName(), applicationName());
     }
   }
 
   /** The synchronous deployment — package-private so tests drive it without the worker. */
-  void execute(String deploymentId) {
+  void execute(String deploymentId, Target target, String commitSha) {
     Plan plan =
         QuarkusTransaction.requiringNew()
             .call(
@@ -487,25 +618,18 @@ public class DeployService {
                     return null; // torn down or swept while queued — nothing to do
                   }
                   deployment.status = CdDeploymentStatus.STARTING;
-                  CdApplication app = deployment.application;
-                  boolean singleton = app.deploymentTarget == CdDeploymentTarget.SINGLETON;
                   return new Plan(
                       deploymentId,
-                      singleton ? null : app.environment.id,
-                      singleton ? null : app.environment.name,
-                      singleton ? null : app.environment.network,
-                      app.id,
-                      app.name,
-                      deployment.commitSha,
-                      app.healthPath != null ? app.healthPath : defaultHealthPath,
-                      app.deploymentTarget,
-                      app.availableOnEnv);
+                      target,
+                      commitSha,
+                      target.healthPath() != null ? target.healthPath() : defaultHealthPath);
                 });
     if (plan == null) {
       return;
     }
 
-    String imageRef = ImageRefs.imageRef(registryHost, imageRepository, plan.applicationName(), plan.sha());
+    String imageRef =
+        ImageRefs.imageRef(registryHost, imageRepository, plan.applicationName(), plan.sha());
 
     // The registry having no image for a green build is an expected outcome (nothing may publish
     // this application yet) and gets its own state rather than a generic failure.
@@ -659,7 +783,9 @@ public class DeployService {
             .call(
                 () -> {
                   List<String> old = new ArrayList<>();
-                  for (CdDeployment previous : deployments.listActiveByApplication(plan.applicationId())) {
+                  for (CdDeployment previous :
+                      deployments.listActiveByApplication(
+                          plan.applicationName(), plan.environmentId())) {
                     previous.status = CdDeploymentStatus.DECOMMISSIONED;
                     previous.finishedAt = Instant.now();
                     if (previous.containerName != null) {
@@ -703,7 +829,7 @@ public class DeployService {
     return new DeploymentDriver.StartSpec(
         plan.environmentId(),
         plan.environmentName(),
-        plan.applicationId(),
+        CdApplicationKeys.of(plan.environmentId(), plan.applicationName()),
         plan.applicationName(),
         plan.deploymentId(),
         plan.sha(),
@@ -711,7 +837,7 @@ public class DeployService {
         imageRef,
         containerName,
         plan.healthPath(),
-        plan.target(),
+        plan.target().target(),
         plan.availableOnEnv());
   }
 

@@ -209,11 +209,13 @@ paths:
       summary: List environments
       responses:
         "200":
-          description: OK
+          description: The environments
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ListEnvironmentsResponse"
+        "502":
+          description: qits-serviceregistry could not be reached
       tags:
       - Cd Environment Controller
     post:
@@ -231,6 +233,8 @@ paths:
           description: "A name, branch or path failed validation"
         "409":
           description: An environment of that name already exists
+        "502":
+          description: qits-serviceregistry could not be reached
       tags:
       - Cd Environment Controller
   /cd/api/environments/{environmentId}:
@@ -261,6 +265,8 @@ paths:
           description: No such environment
         "409":
           description: Another environment already has that name
+        "502":
+          description: qits-serviceregistry could not be reached
       tags:
       - Cd Environment Controller
     get:
@@ -280,6 +286,8 @@ paths:
                 $ref: "#/components/schemas/EnvironmentResponse"
         "404":
           description: No such environment
+        "502":
+          description: qits-serviceregistry could not be reached
       tags:
       - Cd Environment Controller
     delete:
@@ -295,6 +303,8 @@ paths:
           description: Torn down
         "404":
           description: No such environment
+        "502":
+          description: qits-serviceregistry could not be reached
       tags:
       - Cd Environment Controller
   /cd/api/pins:

@@ -7,6 +7,9 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 import eu.wohlben.qits.cd.control.FakeDeploymentDriver;
 import eu.wohlben.qits.cd.control.FakeSpecSource;
+import eu.wohlben.qits.cd.registry.StubRegistry;
+import io.quarkus.test.common.TestResourceScope;
+import io.quarkus.test.common.WithTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.http.ContentType;
@@ -18,6 +21,7 @@ import org.junit.jupiter.api.Test;
 
 /** What emptying {@code qits.cd.legacy-network} changes: the dual-home join, and nothing else. */
 @QuarkusTest
+@WithTestResource(value = StubRegistry.class, scope = TestResourceScope.GLOBAL)
 @TestProfile(LegacyNetworkOffProfile.class)
 public class LegacyNetworkOffTest {
 

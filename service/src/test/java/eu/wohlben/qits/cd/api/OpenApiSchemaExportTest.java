@@ -2,6 +2,9 @@ package eu.wohlben.qits.cd.api;
 
 import static io.restassured.RestAssured.given;
 
+import eu.wohlben.qits.cd.registry.StubRegistry;
+import io.quarkus.test.common.TestResourceScope;
+import io.quarkus.test.common.WithTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -20,6 +23,7 @@ import org.junit.jupiter.api.Test;
  * in the committed document unless it is {@code @Operation(hidden = true)}.
  */
 @QuarkusTest
+@WithTestResource(value = StubRegistry.class, scope = TestResourceScope.GLOBAL)
 public class OpenApiSchemaExportTest {
 
   @Test

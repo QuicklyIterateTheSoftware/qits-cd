@@ -14,7 +14,10 @@ import eu.wohlben.qits.cd.control.FakeSpecSource;
 import eu.wohlben.qits.cd.entity.CdDeployment;
 import eu.wohlben.qits.cd.entity.CdDeploymentTarget;
 import eu.wohlben.qits.cd.persistence.CdDeploymentRepository;
+import eu.wohlben.qits.cd.registry.StubRegistry;
 import io.quarkus.narayana.jta.QuarkusTransaction;
+import io.quarkus.test.common.TestResourceScope;
+import io.quarkus.test.common.WithTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
 import jakarta.inject.Inject;
@@ -33,6 +36,7 @@ import org.junit.jupiter.api.Test;
  * than reaching into the service — the same way a caller experiences the API.
  */
 @QuarkusTest
+@WithTestResource(value = StubRegistry.class, scope = TestResourceScope.GLOBAL)
 public class CdDeploymentFlowTest {
 
   private static final String SHA_A = "a".repeat(40);
@@ -47,12 +51,13 @@ public class CdDeploymentFlowTest {
   void reset() {
     driver.reset();
     specs.reset();
+    StubRegistry.reset();
   }
 
-  private String createEnvironment(String name, String repoId, String appName) {
+  private String createEnvironment(String name) {
     return given()
         .contentType(ContentType.JSON)
-        .body(Map.of("name", name, "applications", List.of(Map.of("repoId", repoId, "name", appName))))
+        .body(Map.of("name", name))
         .when()
         .post("/cd/api/environments")
         .then()
@@ -122,15 +127,15 @@ public class CdDeploymentFlowTest {
    * A singleton's deployments are unreachable through the environment-scoped listing, so a test
    * about one reads the row directly — the same thing CdSweepAdoptionTest does for the same reason.
    */
-  private CdDeployment deploymentOf(String applicationId, String sha) {
+  private CdDeployment deploymentOf(String applicationName, String environmentId, String sha) {
     return QuarkusTransaction.requiringNew()
         .call(
             () ->
-                deployments.listByApplication(applicationId).stream()
+                deployments.listByApplication(applicationName, environmentId).stream()
                     .filter(d -> sha.equals(d.commitSha))
                     .findFirst()
                     .orElseThrow(
-                        () -> new AssertionError("no deployment of " + applicationId + " at " + sha)));
+                        () -> new AssertionError("no deployment of " + applicationName + " at " + sha)));
   }
 
   /** Singletons have no environment to read deployments through — wait on the driver instead. */
@@ -148,34 +153,34 @@ public class CdDeploymentFlowTest {
 
   @Test
   public void aGreenBuildOnTheListenedBranchDeploys() {
-    String environmentId = createEnvironment("flow-green", "repo-green", "app-green");
+    String environmentId = createEnvironment("flow-green");
     postBuildSucceeded("repo-green", "environment/flow-green", SHA_A);
 
     List<Map<String, Object>> deployments = awaitDeployments(environmentId, 1);
     Map<String, Object> deployment = deployments.get(0);
     assertEquals("ACTIVE", deployment.get("status"));
     assertEquals(SHA_A, deployment.get("commitSha"));
-    assertEquals("app-green", deployment.get("applicationName"));
+    assertEquals("repo-green", deployment.get("applicationName"));
     // The run that caused it, straight from the intake and out again on the read surface — this is
     // the whole deployment -> /ci/runs/<runId> click-through.
     assertEquals("run-1", deployment.get("runId"));
     String containerName = (String) deployment.get("containerName");
     assertTrue(
-        containerName.startsWith("qits-cd-flow-green-app-green-"),
+        containerName.startsWith("qits-cd-flow-green-repo-green-"),
         "container is named after environment, application and deployment: " + containerName);
 
     // The image reference is DERIVED — the convention is the contract under test.
-    assertEquals(List.of("qits-artifacts:8080/qits/app-green:" + SHA_A), driver.pulledRefs());
+    assertEquals(List.of("qits-artifacts:8080/qits/repo-green:" + SHA_A), driver.pulledRefs());
     DeploymentDriver.StartSpec spec = driver.started().get(0);
     // The primary network is the application's OWN, not the environment's bundle: an ordinary
     // application is a spoke, and only its own containers are on it.
-    assertEquals("qits-env-flow-green-app-green", spec.network());
-    assertEquals("app-green", spec.applicationName());
+    assertEquals("qits-env-flow-green-repo-green", spec.network());
+    assertEquals("repo-green", spec.applicationName());
     assertEquals(CdDeploymentTarget.ENVIRONMENT, spec.target());
     // ...and it joins the legacy network after the start, which is the transition membership that
     // keeps today's direct cross-application URLs resolving.
     assertTrue(
-        driver.connections().contains("qits-net:" + containerName + ":app-green"),
+        driver.connections().contains("qits-net:" + containerName + ":repo-green"),
         "the fresh container joins the legacy network: " + driver.connections());
     // No healthPath named at creation: the shipped default reaches the driver.
     assertEquals("/q/health/ready", spec.healthPath());
@@ -185,7 +190,7 @@ public class CdDeploymentFlowTest {
 
   @Test
   public void theNextGreenBuildCutsOverAndDecommissionsThePrevious() {
-    String environmentId = createEnvironment("flow-cutover", "repo-cutover", "app-cutover");
+    String environmentId = createEnvironment("flow-cutover");
     postBuildSucceeded("repo-cutover", "environment/flow-cutover", SHA_A);
     awaitDeployments(environmentId, 1);
     String firstContainer = driver.started().get(0).containerName();
@@ -206,14 +211,14 @@ public class CdDeploymentFlowTest {
     driver.scriptPull(
         new DeploymentDriver.PullResult(
             DeploymentDriver.PullOutcome.IMAGE_MISSING, "manifest unknown"));
-    String environmentId = createEnvironment("flow-noimage", "repo-noimage", "app-noimage");
+    String environmentId = createEnvironment("flow-noimage");
     postBuildSucceeded("repo-noimage", "environment/flow-noimage", SHA_A);
 
     List<Map<String, Object>> deployments = awaitDeployments(environmentId, 1);
     assertEquals("IMAGE_MISSING", deployments.get(0).get("status"));
     String detail = (String) deployments.get(0).get("detail");
     assertTrue(
-        detail.contains("qits-artifacts:8080/qits/app-noimage:" + SHA_A),
+        detail.contains("qits-artifacts:8080/qits/repo-noimage:" + SHA_A),
         "the detail names the reference nothing published: " + detail);
     // Nothing was started and nothing removed — the previous state is untouched.
     assertEquals(List.of(), driver.started());
@@ -222,7 +227,7 @@ public class CdDeploymentFlowTest {
 
   @Test
   public void aFailedHealthGateRemovesTheFreshContainerAndKeepsTheOldOneServing() {
-    String environmentId = createEnvironment("flow-unhealthy", "repo-unhealthy", "app-unhealthy");
+    String environmentId = createEnvironment("flow-unhealthy");
     postBuildSucceeded("repo-unhealthy", "environment/flow-unhealthy", SHA_A);
     awaitDeployments(environmentId, 1);
     String healthyContainer = driver.started().get(0).containerName();
@@ -244,7 +249,7 @@ public class CdDeploymentFlowTest {
   @Test
   public void aRefusedStartIsAFailedDeployment() {
     driver.scriptStart(new DeploymentDriver.StartResult(false, "docker: connection refused"));
-    String environmentId = createEnvironment("flow-refused", "repo-refused", "app-refused");
+    String environmentId = createEnvironment("flow-refused");
     postBuildSucceeded("repo-refused", "environment/flow-refused", SHA_A);
 
     List<Map<String, Object>> deployments = awaitDeployments(environmentId, 1);
@@ -255,7 +260,7 @@ public class CdDeploymentFlowTest {
   public void theReplaceCutoverStopsAliasHoldersBeforeStartingAndRemovesThemAfterTheGate() {
     // The predecessor here is NOT one of cd's own rows — it is whatever holds the alias, which is
     // how the compose-seeded originals hand over to cd on their first pipeline deployment.
-    String environmentId = createEnvironment("flow-replace", "repo-replace", "app-replace");
+    String environmentId = createEnvironment("flow-replace");
     driver.scriptAliasHolders(List.of(new DeploymentDriver.Holder("c0ffee".repeat(10) + "beef", "seeded-original", null)));
     postBuildSucceeded("repo-replace", "environment/flow-replace", SHA_A);
 
@@ -274,7 +279,7 @@ public class CdDeploymentFlowTest {
 
   @Test
   public void aFailedGateRestartsWhatTheCutoverStopped() {
-    String environmentId = createEnvironment("flow-rollback", "repo-rollback", "app-rollback");
+    String environmentId = createEnvironment("flow-rollback");
     driver.scriptAliasHolders(List.of(new DeploymentDriver.Holder("dead".repeat(16), "previous-app", null)));
     driver.scriptHealth(new DeploymentDriver.HealthResult(false, "container exited"));
     postBuildSucceeded("repo-rollback", "environment/flow-rollback", SHA_A);
@@ -292,7 +297,7 @@ public class CdDeploymentFlowTest {
     // Deploying the application whose alias this very instance holds: the worker must not stop
     // its own process. It starts the successor, launches the detached referee, and leaves the row
     // STARTING — the surviving instance's sweep records the outcome, not this one.
-    String environmentId = createEnvironment("flow-self", "repo-self", "qits-cd");
+    String environmentId = createEnvironment("flow-self");
     String selfId = "abcdef123456";
     String selfFullId = selfId + "f".repeat(52);
     driver.scriptSelfId(selfId);
@@ -374,7 +379,7 @@ public class CdDeploymentFlowTest {
 
   @Test
   public void aBranchNoEnvironmentListensToDeploysNothing() {
-    String environmentId = createEnvironment("flow-other", "repo-other", "app-other");
+    String environmentId = createEnvironment("flow-other");
     postBuildSucceeded("repo-other", "main", SHA_A);
 
     // 202 (fire-and-forget sender), but nothing was queued or pulled.
@@ -388,7 +393,7 @@ public class CdDeploymentFlowTest {
     // Derived registration: nothing declared repo-derived anywhere, and a green build on the
     // environment's branch is the whole registration. The row is named after the repository and
     // carries the defaults its (absent) deployments.yml implies.
-    String environmentId = createEnvironment("flow-derive", "repo-seeded", "app-seeded");
+    String environmentId = createEnvironment("flow-derive");
     postBuildSucceeded("repo-derived", "environment/flow-derive", SHA_A);
 
     List<Map<String, Object>> deployments = awaitDeployments(environmentId, 1);
@@ -416,7 +421,7 @@ public class CdDeploymentFlowTest {
 
   @Test
   public void aPublicNodeJoinsTheBundleAndEveryApplicationNetworkOfItsEnvironment() {
-    String environmentId = createEnvironment("flow-hub", "repo-hub-seed", "app-hub-seed");
+    String environmentId = createEnvironment("flow-hub");
     // One application network of this environment already exists — the hub has to end up on it.
     driver.scriptExistingNetwork(
         new DeploymentDriver.Network(
@@ -444,7 +449,7 @@ public class CdDeploymentFlowTest {
 
   @Test
   public void aSingletonRunsOnThePlatformNetworkAndJoinsEveryApplicationNetwork() {
-    String environmentId = createEnvironment("flow-single", "repo-single-seed", "app-single-seed");
+    String environmentId = createEnvironment("flow-single");
     driver.scriptExistingNetwork(
         new DeploymentDriver.Network(
             "qits-env-flow-single-app-single-seed",
@@ -505,7 +510,7 @@ public class CdDeploymentFlowTest {
     // The reconciliation: the network did not exist a moment ago, so nobody is on it. What the
     // application needs there is the environment's public nodes and every singleton — found by
     // container label, because docker is the membership bookkeeping.
-    String environmentId = createEnvironment("flow-reconcile", "repo-rec-seed", "app-rec-seed");
+    String environmentId = createEnvironment("flow-reconcile");
     driver.scriptHubContainers(
         List.of(new DeploymentDriver.Endpoint("hub-id", "qits-gateway")));
     driver.scriptSingletonContainers(
@@ -527,7 +532,7 @@ public class CdDeploymentFlowTest {
     // it behind with nobody on it. The next deploy does NOT create it, and if that were the
     // reconciliation's trigger the application would stay unreachable from the gateway and from
     // every singleton for as long as no hub happened to redeploy.
-    String environmentId = createEnvironment("flow-reheal", "repo-reheal-seed", "app-reheal-seed");
+    String environmentId = createEnvironment("flow-reheal");
     driver.scriptExistingNetwork(
         new DeploymentDriver.Network(
             "qits-env-flow-reheal-repo-reheal",
@@ -552,7 +557,7 @@ public class CdDeploymentFlowTest {
     // The migration case, stated as its own test: a container the previous cd (or the bootstrap's
     // compose) started carries no environment label at all, and it is exactly the one a deployment
     // has to replace rather than run beside.
-    String environmentId = createEnvironment("flow-adopt", "repo-adopt", "repo-adopt");
+    String environmentId = createEnvironment("flow-adopt");
     driver.scriptAliasHolders(
         List.of(new DeploymentDriver.Holder("aa".repeat(32), "seeded-original", null)));
     postBuildSucceeded("repo-adopt", "environment/flow-adopt", SHA_A);
@@ -568,7 +573,7 @@ public class CdDeploymentFlowTest {
     // environment's copy of the same application, healthy, under the same alias. Stopping that one
     // would be a deployment of one tier reaching into another; the environment label is what keeps
     // this deployment to its own.
-    String environmentId = createEnvironment("flow-scope", "repo-scope", "repo-scope");
+    String environmentId = createEnvironment("flow-scope");
     driver.scriptAliasHolders(
         List.of(
             new DeploymentDriver.Holder("bb".repeat(32), "mine", environmentId),
@@ -610,7 +615,7 @@ public class CdDeploymentFlowTest {
     // The health gate curls localhost INSIDE the container, so it passes just as happily on a
     // network nobody else is on: a join cd asked for and did not get can only be caught here. The
     // rollback is the failed-gate one — the fresh container goes, the predecessor serves again.
-    String environmentId = createEnvironment("flow-nojoin", "repo-nojoin", "repo-nojoin");
+    String environmentId = createEnvironment("flow-nojoin");
     driver.scriptAliasHolders(
         List.of(new DeploymentDriver.Holder("ff".repeat(32), "still-serving", environmentId)));
     driver.scriptRefusedJoin("qits-net", "Error response from daemon: network qits-net not found");
@@ -633,13 +638,13 @@ public class CdDeploymentFlowTest {
     // The union IS the migration: today's containers hold their alias on qits-net and on no
     // per-application network at all, so a search of the new networks alone would start a second
     // copy beside the one that is serving.
-    String environmentId = createEnvironment("flow-union", "repo-union", "app-union");
+    String environmentId = createEnvironment("flow-union");
     postBuildSucceeded("repo-union", "environment/flow-union", SHA_A);
     awaitDeployments(environmentId, 1);
 
     assertTrue(
         driver.aliasSearches().stream()
-            .anyMatch(s -> s.contains("qits-env-flow-union-app-union") && s.contains("qits-net")),
+            .anyMatch(s -> s.contains("qits-env-flow-union-repo-union") && s.contains("qits-net")),
         "the search covers the primary and the legacy network: " + driver.aliasSearches());
   }
 
@@ -648,7 +653,7 @@ public class CdDeploymentFlowTest {
     // The live migration, in one test: qits-idp and qits-cd are environment applications today and
     // become singletons with the commit that adds their deployments.yml. The old rows must not sit
     // beside the new one — one repository deploys to one place.
-    String environmentId = createEnvironment("flow-convert", "repo-convert", "repo-convert");
+    String environmentId = createEnvironment("flow-convert");
     postBuildSucceeded("repo-convert", "environment/flow-convert", SHA_A);
     awaitDeployments(environmentId, 1);
 
@@ -695,7 +700,7 @@ public class CdDeploymentFlowTest {
     // the history", and the environment deployment would find the running singleton through the
     // legacy network and remove it — leaving a singleton row saying ACTIVE about nothing. So it is
     // refused, and the refusal is written where an operator looks: a FAILED row on the singleton.
-    createEnvironment("flow-unflip", "repo-unflip-seed", "app-unflip-seed");
+    createEnvironment("flow-unflip");
     specs.script(
         "repo-unflip", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null));
     postBuildSucceeded("repo-unflip", "main", SHA_A);
@@ -725,7 +730,7 @@ public class CdDeploymentFlowTest {
     assertEquals(1, driver.started().size(), "the refused build started nothing");
 
     // ...and the refusal is on the record, naming the flip.
-    CdDeployment refused = deploymentOf(rows.get(0).get("id").toString(), SHA_B);
+    CdDeployment refused = deploymentOf("repo-unflip", null, SHA_B);
     assertEquals("FAILED", refused.status.name());
     assertTrue(
         refused.detail.contains("deployment_target: environment"),
@@ -786,25 +791,47 @@ public class CdDeploymentFlowTest {
 
   @Test
   public void aSpecThatCannotBeReadFailsTheDeploymentRatherThanGuessing() {
-    String environmentId = createEnvironment("flow-nospec", "repo-nospec", "app-nospec");
-    specs.scriptFailure("repo-nospec", "the git host answered 500");
+    // One green build first, so the registry knows where this repository deploys. That order is
+    // the contract, not scaffolding: a spec read that fails for a repository nothing has
+    // registered has no row to fail and records nothing (the 202-and-silence an unknown
+    // repository always got); one that fails for a registered application fails it, there.
+    String environmentId = createEnvironment("flow-nospec");
     postBuildSucceeded("repo-nospec", "environment/flow-nospec", SHA_A);
+    awaitDeployments(environmentId, 1);
+    driver.reset();
 
-    List<Map<String, Object>> deployments = awaitDeployments(environmentId, 1);
+    specs.scriptFailure("repo-nospec", "the git host answered 500");
+    postBuildSucceeded("repo-nospec", "environment/flow-nospec", SHA_B);
+
+    List<Map<String, Object>> deployments = awaitDeployments(environmentId, 2);
     assertEquals("FAILED", deployments.get(0).get("status"));
+    assertEquals(SHA_B, deployments.get(0).get("commitSha"));
     assertTrue(
         ((String) deployments.get(0).get("detail")).contains("the git host answered 500"),
         "the cause is on the row: " + deployments.get(0).get("detail"));
     // Nothing was pulled and nothing started — cd never guesses a topology.
     assertEquals(List.of(), driver.pulledRefs());
     assertEquals(List.of(), driver.started());
+    // ...and what was serving is still serving.
+    assertEquals("ACTIVE", deployments.get(1).get("status"));
+  }
+
+  @Test
+  public void aSpecThatCannotBeReadForAnUnknownRepositoryRecordsNothing() {
+    String environmentId = createEnvironment("flow-nospec-unknown");
+    specs.scriptFailure("repo-nospec-unknown", "the git host answered 500");
+    postBuildSucceeded("repo-nospec-unknown", "environment/flow-nospec-unknown", SHA_A);
+
+    awaitWorkerIdle();
+    awaitDeployments(environmentId, 0);
+    assertEquals(List.of(), driver.pulledRefs());
   }
 
   @Test
   public void eachDeploymentCarriesTheRunOfTheBuildThatCausedIt() {
     // Two green builds of the same application: each row names its own run, so the click-through
     // from a historical deployment reaches the build that produced THAT image, not the newest one.
-    String environmentId = createEnvironment("flow-runid", "repo-runid", "app-runid");
+    String environmentId = createEnvironment("flow-runid");
     postBuildSucceeded("6f31a0c4-1c2b-4f7a-9b03-2ee45c1f8d61", "repo-runid", "environment/flow-runid", SHA_A);
     awaitDeployments(environmentId, 1);
     postBuildSucceeded("b41d7e90-9a11-4c33-8f0d-77c0e13a4412", "repo-runid", "environment/flow-runid", SHA_B);
@@ -820,7 +847,7 @@ public class CdDeploymentFlowTest {
   public void aDeploymentWithNoRunNamesNoneRatherThanInventingOne() {
     // The sender may omit runId — every deployment recorded before the column existed reads this
     // way too, and the read surface must say null rather than guess a run from the sha.
-    String environmentId = createEnvironment("flow-norunid", "repo-norunid", "app-norunid");
+    String environmentId = createEnvironment("flow-norunid");
     given()
         .contentType(ContentType.JSON)
         .body(Map.of("repoId", "repo-norunid", "branch", "environment/flow-norunid", "commitSha", SHA_A))

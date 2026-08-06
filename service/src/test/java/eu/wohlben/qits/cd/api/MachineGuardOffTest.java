@@ -2,6 +2,9 @@ package eu.wohlben.qits.cd.api;
 
 import static io.restassured.RestAssured.given;
 
+import eu.wohlben.qits.cd.registry.StubRegistry;
+import io.quarkus.test.common.TestResourceScope;
+import io.quarkus.test.common.WithTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
 import org.junit.jupiter.api.Test;
@@ -12,6 +15,7 @@ import org.junit.jupiter.api.Test;
  * — it runs on the default profile, against the same config a deployment gets.
  */
 @QuarkusTest
+@WithTestResource(value = StubRegistry.class, scope = TestResourceScope.GLOBAL)
 class MachineGuardOffTest {
 
   @Test

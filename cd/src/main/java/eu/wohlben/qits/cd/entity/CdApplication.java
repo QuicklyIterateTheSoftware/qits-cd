@@ -13,22 +13,15 @@ import jakarta.persistence.Table;
 import java.time.Instant;
 
 /**
- * One deployable application: a repository (a plain String id — cd holds no FK into any other
- * context's tables) and the name the deployed container answers to. The name is load-bearing three
- * times over: it is the image path in the registry ({@code <repository>/<name>:<sha>}), the network
- * alias peers resolve, and part of the container name.
+ * One deployable application: a repository and the name the deployed container answers to.
  *
- * <p><b>Rows here are derived, not declared.</b> A green build carries cd to the repository's
- * {@code .config/qits/deployments.yml} at that commit, and the row is created or brought up to date
- * from it. Nothing has to register an application first.
+ * <p><b>FROZEN.</b> qits-serviceregistry owns applications since the extraction — as services with
+ * environment links, where the name is the whole identity. These rows are cd v1's, kept for one
+ * release so the one-time export ({@code RegistryExport}) can be repeated or audited, and read by
+ * nothing else. A later cleanup migration drops this table and {@code cd_environment} together.
  *
  * <p>{@link #environment} is null exactly when {@link #deploymentTarget} is {@code SINGLETON} — the
- * two say the same thing, one as a null and one as a word. A singleton is platform-plane: it has no
- * tier, so it carries its own {@link #branch}; an environment application takes its branch from its
- * environment.
- *
- * <p>The FK to {@link CdEnvironment} is inside cd's own DB, which is fine — the "string ids, never
- * FK" rule is about other contexts' tables.
+ * two say the same thing, one as a null and one as a word, and the export reads both.
  */
 @Entity
 @Table(name = "cd_application")

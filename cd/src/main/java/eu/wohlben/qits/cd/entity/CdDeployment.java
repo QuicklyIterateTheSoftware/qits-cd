@@ -5,10 +5,7 @@ import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
 import jakarta.persistence.Enumerated;
-import jakarta.persistence.FetchType;
 import jakarta.persistence.Id;
-import jakarta.persistence.JoinColumn;
-import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
 import java.time.Instant;
 
@@ -17,6 +14,11 @@ import java.time.Instant;
  * build-succeeded intake, driven to a terminal state by the deploy worker; the previously {@code
  * ACTIVE} deployment of the same application becomes {@code DECOMMISSIONED} the moment its
  * replacement passes the health gate — never before.
+ *
+ * <p><b>This is the whole of cd's own domain now.</b> The application and the environment it names
+ * live in qits-serviceregistry, so they are plain strings here with no FK — the {@code repo_id}
+ * stance, applied across a service boundary. That is what lets the deployment history, and the
+ * rollback pins read off it, stay up while the registry is down.
  */
 @Entity
 @Table(name = "cd_deployment")
@@ -24,9 +26,13 @@ public class CdDeployment extends PanacheEntityBase {
 
   @Id public String id;
 
-  @ManyToOne(optional = false, fetch = FetchType.LAZY)
-  @JoinColumn(name = "application_id", nullable = false)
-  public CdApplication application;
+  /** The service this deployed, by name — the registry's own identity for it. */
+  @Column(name = "application_name", nullable = false, length = 64)
+  public String applicationName;
+
+  /** The tier it was deployed into, or null for a platform singleton. */
+  @Column(name = "environment_id")
+  public String environmentId;
 
   @Column(name = "commit_sha", nullable = false, length = 64)
   public String commitSha;
@@ -62,4 +68,15 @@ public class CdDeployment extends PanacheEntityBase {
 
   @Column(name = "finished_at")
   public Instant finishedAt;
+
+  /**
+   * The listing tiebreak, assigned by the database (V5's identity column) and never written here —
+   * which is why it reads null on a freshly persisted instance.
+   *
+   * <p>It exists because {@code createdAt} is not unique: two rows recorded in the same tick tied,
+   * and the secondary sort was the random-UUID id, so a listing swapped them arbitrarily between
+   * calls. This is monotonic, so "newest first" is one answer rather than a coin flip.
+   */
+  @Column(name = "seq", insertable = false, updatable = false)
+  public Long seq;
 }

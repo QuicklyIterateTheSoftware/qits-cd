@@ -2,6 +2,9 @@ package eu.wohlben.qits.cd.api;
 
 import static io.restassured.RestAssured.given;
 
+import eu.wohlben.qits.cd.registry.StubRegistry;
+import io.quarkus.test.common.TestResourceScope;
+import io.quarkus.test.common.WithTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.http.ContentType;
@@ -16,6 +19,7 @@ import org.junit.jupiter.api.Test;
  * application.properties is wrong, not only if the guard is missing.
  */
 @QuarkusTest
+@WithTestResource(value = StubRegistry.class, scope = TestResourceScope.GLOBAL)
 @TestProfile(MachineGuardEnforcedProfile.class)
 class MachineGuardEnforcedTest {
 

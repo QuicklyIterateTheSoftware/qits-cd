@@ -1,8 +1,8 @@
 package eu.wohlben.qits.cd.api;
 
 import eu.wohlben.qits.cd.control.EnvironmentService;
+import eu.wohlben.qits.cd.control.RegistryClient.RegEnvironment;
 import eu.wohlben.qits.cd.dto.CdEnvironmentDto;
-import eu.wohlben.qits.cd.entity.CdEnvironment;
 import eu.wohlben.qits.cd.mapper.CdMapper;
 import jakarta.inject.Inject;
 import jakarta.validation.Valid;
@@ -20,6 +20,7 @@ import jakarta.ws.rs.core.Response;
 import java.util.List;
 import org.eclipse.microprofile.openapi.annotations.Operation;
 import org.eclipse.microprofile.openapi.annotations.responses.APIResponse;
+import org.jboss.logging.Logger;
 
 /**
  * The environment surface: creating a tier, renaming or retargeting it, tearing it down, and the
@@ -27,6 +28,11 @@ import org.eclipse.microprofile.openapi.annotations.responses.APIResponse;
  * deployments are read via {@code CdDeploymentController} with the environment as a required
  * filter, and the flat application registry (singletons included) is {@code
  * CdApplicationController}.
+ *
+ * <p><b>The rows behind it are qits-serviceregistry's.</b> This surface stayed when the registry
+ * took the domain over, because it is where a create also makes a docker network and a delete also
+ * reaps containers — cd holds the socket. The request and response shapes are unchanged, which is
+ * the whole reason the bootstrap and qits-spa-cd needed no release beside this one.
  *
  * <p>A tier is created <b>deliberately</b>; what it holds is not. Application rows are derived from
  * each repository's {@code deployments.yml} on every green build, so this surface has no write for
@@ -39,22 +45,23 @@ import org.eclipse.microprofile.openapi.annotations.responses.APIResponse;
  * <p><b>No {@code MachineAuth} guard, deliberately.</b> These writes are reachable by a person
  * through qits-gateway's session, so a bearer is not the only credential a caller could hold, and
  * demanding one would lock the humans out the day the gate flips on. The build-succeeded intake is
- * the opposite — machine-only — and carries the guard. When the epic orchestration becomes a real
- * machine sender, giving it a token and guarding these two writes is one change, not this one.
+ * the opposite — machine-only — and carries the guard.
  */
 @Path("/environments")
 @Produces(MediaType.APPLICATION_JSON)
 @Consumes(MediaType.APPLICATION_JSON)
 public class CdEnvironmentController {
 
+  private static final Logger LOG = Logger.getLogger(CdEnvironmentController.class);
+
   @Inject EnvironmentService environmentService;
   @Inject CdMapper mapper;
 
   /**
-   * One tracked application. {@code healthPath} null means the shipped default.
+   * One tracked application.
    *
-   * @deprecated applications are derived from each repository's {@code deployments.yml} on every
-   *     green build — see {@link CreateEnvironmentRequest#applications()}.
+   * @deprecated ignored since the registry extraction — see {@link
+   *     CreateEnvironmentRequest#applications()}.
    */
   @Deprecated
   public record ApplicationSpec(@NotBlank String repoId, @NotBlank String name, String healthPath) {}
@@ -63,11 +70,12 @@ public class CdEnvironmentController {
    * The creation payload. {@code branch} and {@code network} are conventions when omitted: {@code
    * environment/<name>} and {@code qits-env-<name>}.
    *
-   * <p>{@code applications} is <b>optional and deprecated</b>. Application rows are derived from
-   * each repository's own {@code .config/qits/deployments.yml} on every green build, so naming them
-   * here only pre-creates what the next build would create anyway — and pre-creating them states a
-   * topology the repository has not agreed to. It is still accepted so an older bootstrap keeps
-   * working; send nothing.
+   * <p>{@code applications} is <b>deprecated and now ignored</b>, with a WARN so a sender finds out.
+   * Application rows have been derived from each repository's own {@code
+   * .config/qits/deployments.yml} since before the extraction, so naming them here only pre-created
+   * what the next green build creates anyway — and qits-serviceregistry holds one identity for a
+   * service (its name), so a {@code (repoId, name)} pair that disagrees has nowhere to land. The
+   * field is still accepted so an older sender's payload keeps deserializing; send nothing.
    */
   public record CreateEnvironmentRequest(
       @NotBlank String name,
@@ -90,17 +98,16 @@ public class CdEnvironmentController {
   @APIResponse(responseCode = "201", description = "Created; green builds on the branch now deploy")
   @APIResponse(responseCode = "400", description = "A name, branch or path failed validation")
   @APIResponse(responseCode = "409", description = "An environment of that name already exists")
+  @APIResponse(responseCode = "502", description = "qits-serviceregistry could not be reached")
   public Response create(@Valid CreateEnvironmentRequest request) {
-    List<ApplicationSpec> declared =
-        request.applications() == null ? List.of() : request.applications();
-    CdEnvironment environment =
-        environmentService.create(
-            request.name(),
-            request.branch(),
-            request.network(),
-            declared.stream()
-                .map(a -> new EnvironmentService.ApplicationSpec(a.repoId(), a.name(), a.healthPath()))
-                .toList());
+    if (request.applications() != null && !request.applications().isEmpty()) {
+      LOG.warnf(
+          "Ignoring %d declared application(s) on the creation of environment %s — applications are"
+              + " derived from each repository's deployments.yml on its next green build",
+          request.applications().size(), request.name());
+    }
+    RegEnvironment environment =
+        environmentService.create(request.name(), request.branch(), request.network());
     return Response.status(Response.Status.CREATED).entity(toResponse(environment)).build();
   }
 
@@ -117,9 +124,10 @@ public class CdEnvironmentController {
   @APIResponse(responseCode = "400", description = "A name or branch failed validation")
   @APIResponse(responseCode = "404", description = "No such environment")
   @APIResponse(responseCode = "409", description = "Another environment already has that name")
+  @APIResponse(responseCode = "502", description = "qits-serviceregistry could not be reached")
   public EnvironmentResponse update(
       @PathParam("environmentId") String environmentId, UpdateEnvironmentRequest request) {
-    CdEnvironment environment =
+    RegEnvironment environment =
         environmentService.update(
             environmentId,
             request == null ? null : request.name(),
@@ -130,6 +138,10 @@ public class CdEnvironmentController {
   /** All environments, newest-first, without their applications (fetch one for the full shape). */
   @GET
   @Operation(summary = "List environments")
+  // The 200 is spelled out because declaring ANY response suppresses the generated one, and this
+  // operation had only the generated one — leaving it off would drop the schema from the document.
+  @APIResponse(responseCode = "200", description = "The environments")
+  @APIResponse(responseCode = "502", description = "qits-serviceregistry could not be reached")
   public ListEnvironmentsResponse list() {
     return new ListEnvironmentsResponse(
         environmentService.list().stream().map(mapper::toDto).toList());
@@ -140,26 +152,28 @@ public class CdEnvironmentController {
   @Operation(summary = "One environment with the applications it tracks")
   @APIResponse(responseCode = "200", description = "The environment")
   @APIResponse(responseCode = "404", description = "No such environment")
+  @APIResponse(responseCode = "502", description = "qits-serviceregistry could not be reached")
   public EnvironmentResponse get(@PathParam("environmentId") String environmentId) {
     return toResponse(environmentService.require(environmentId));
   }
 
   /**
-   * Tear the environment down: its recorded deployments, its containers, its network. 204 — after
-   * this the branch deploys nowhere.
+   * Tear the environment down: cd's recorded deployments, its containers, its networks, and last
+   * the tier itself in qits-serviceregistry. 204 — after this the branch deploys nowhere.
    */
   @DELETE
   @Path("/{environmentId}")
   @Operation(summary = "Tear an environment down (rows, containers, network)")
   @APIResponse(responseCode = "204", description = "Torn down")
   @APIResponse(responseCode = "404", description = "No such environment")
+  @APIResponse(responseCode = "502", description = "qits-serviceregistry could not be reached")
   public Response delete(@PathParam("environmentId") String environmentId) {
     environmentService.delete(environmentId);
     return Response.noContent().build();
   }
 
-  private EnvironmentResponse toResponse(CdEnvironment environment) {
+  private EnvironmentResponse toResponse(RegEnvironment environment) {
     return new EnvironmentResponse(
-        mapper.toDto(environment, environmentService.applicationsOf(environment.id)));
+        mapper.toDto(environment, environmentService.applicationsOf(environment)));
   }
 }

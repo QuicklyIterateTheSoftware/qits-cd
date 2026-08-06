@@ -1,43 +1,76 @@
 package eu.wohlben.qits.cd.mapper;
 
+import eu.wohlben.qits.cd.control.CdApplicationKeys;
+import eu.wohlben.qits.cd.control.EnvironmentService.ApplicationView;
+import eu.wohlben.qits.cd.control.RegistryClient.RegEnvironment;
+import eu.wohlben.qits.cd.control.RegistryClient.RegService;
 import eu.wohlben.qits.cd.dto.CdApplicationDto;
 import eu.wohlben.qits.cd.dto.CdDeploymentDto;
 import eu.wohlben.qits.cd.dto.CdEnvironmentDto;
-import eu.wohlben.qits.cd.entity.CdApplication;
 import eu.wohlben.qits.cd.entity.CdDeployment;
-import eu.wohlben.qits.cd.entity.CdEnvironment;
+import jakarta.enterprise.context.ApplicationScoped;
 import java.util.List;
-import org.mapstruct.Mapper;
-import org.mapstruct.Mapping;
 
-@Mapper(componentModel = "jakarta")
-public interface CdMapper {
+/**
+ * The wire shapes, unchanged across the registry extraction — which is why this is hand-written
+ * rather than a MapStruct interface now: nothing here is a field-for-field copy any more.
+ *
+ * <p>Environments and applications arrive as {@link eu.wohlben.qits.cd.control.RegistryClient}
+ * records instead of entities, and the two ids a client joins on ({@code CdApplicationDto.id} and
+ * {@code CdDeploymentDto.applicationId}) are <b>derived</b> from {@code (environmentId,
+ * applicationName)} on both sides — there is no application row left to take an id from, and the
+ * client's "the first row per applicationId is the current one" pass has to keep working.
+ * {@link CdApplicationKeys} is the one definition of that id.
+ */
+@ApplicationScoped
+public class CdMapper {
 
-  // Applications are attached explicitly by the boundary (single-environment endpoint only;
-  // listings keep them null) — same shape as ci's run/steps split.
-  @Mapping(target = "applications", ignore = true)
-  CdEnvironmentDto toDto(CdEnvironment entity);
+  /** Applications are attached explicitly by the boundary; listings leave them null. */
+  public CdEnvironmentDto toDto(RegEnvironment environment) {
+    return toDto(environment, null);
+  }
 
-  // The environment is flattened rather than nested: a singleton has none, and a listing that
-  // mixes both wants one shape. `target` is the entity's `deploymentTarget` — the dto says what
-  // the field is, the column says whose.
-  @Mapping(target = "environmentId", source = "environment.id")
-  @Mapping(target = "environmentName", source = "environment.name")
-  @Mapping(target = "target", source = "deploymentTarget")
-  CdApplicationDto toDto(CdApplication entity);
-
-  @Mapping(target = "applicationId", source = "application.id")
-  @Mapping(target = "applicationName", source = "application.name")
-  CdDeploymentDto toDto(CdDeployment entity);
-
-  default CdEnvironmentDto toDto(CdEnvironment entity, List<CdApplication> applications) {
-    CdEnvironmentDto bare = toDto(entity);
+  public CdEnvironmentDto toDto(RegEnvironment environment, List<ApplicationView> applications) {
     return new CdEnvironmentDto(
-        bare.id(),
-        bare.name(),
-        bare.branch(),
-        bare.network(),
-        bare.createdAt(),
-        applications.stream().map(this::toDto).toList());
+        environment.id(),
+        environment.name(),
+        environment.branch(),
+        environment.network(),
+        environment.createdAt(),
+        applications == null ? null : applications.stream().map(this::toDto).toList());
+  }
+
+  /**
+   * The environment is flattened rather than nested: a singleton has none, and a listing that mixes
+   * both wants one shape. {@code repoId} is the service name — the registry holds one identity for
+   * a service, and derived registration has always named an application after its repository.
+   */
+  public CdApplicationDto toDto(ApplicationView view) {
+    RegService service = view.service();
+    return new CdApplicationDto(
+        CdApplicationKeys.of(view.environmentId(), service.name()),
+        service.name(),
+        service.name(),
+        view.environmentId(),
+        view.environmentName(),
+        service.target(),
+        service.availableOnEnv(),
+        service.branch(),
+        service.healthPath(),
+        service.createdAt());
+  }
+
+  public CdDeploymentDto toDto(CdDeployment deployment) {
+    return new CdDeploymentDto(
+        deployment.id,
+        CdApplicationKeys.of(deployment.environmentId, deployment.applicationName),
+        deployment.applicationName,
+        deployment.commitSha,
+        deployment.runId,
+        deployment.status,
+        deployment.containerName,
+        deployment.detail,
+        deployment.createdAt,
+        deployment.finishedAt);
   }
 }

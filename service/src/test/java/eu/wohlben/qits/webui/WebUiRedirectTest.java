@@ -3,6 +3,9 @@ package eu.wohlben.qits.webui;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 
+import eu.wohlben.qits.cd.registry.StubRegistry;
+import io.quarkus.test.common.TestResourceScope;
+import io.quarkus.test.common.WithTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
 
@@ -12,6 +15,7 @@ import org.junit.jupiter.api.Test;
  * Quinoa's, and it must answer whether or not a client is packaged.
  */
 @QuarkusTest
+@WithTestResource(value = StubRegistry.class, scope = TestResourceScope.GLOBAL)
 class WebUiRedirectTest {
 
   @Test

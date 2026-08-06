@@ -22,6 +22,11 @@ import org.eclipse.microprofile.openapi.annotations.Operation;
  *
  * <p>Read-only, and that is the model rather than a phase: rows here are derived from each
  * repository's own {@code .config/qits/deployments.yml} on every green build.
+ *
+ * <p>Since the registry extraction this is a proxied read of qits-serviceregistry's services, one
+ * row per environment link and one per singleton — the same flat shape, from the service that now
+ * owns it. The {@code id} is derived from {@code (environmentId, name)} so a client can still join
+ * it against a deployment's {@code applicationId}.
  */
 @Path("/applications")
 @Produces(MediaType.APPLICATION_JSON)

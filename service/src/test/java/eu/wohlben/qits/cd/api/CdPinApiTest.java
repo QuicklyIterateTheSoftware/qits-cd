@@ -6,6 +6,9 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 import eu.wohlben.qits.cd.control.DeploymentDriver;
 import eu.wohlben.qits.cd.control.FakeDeploymentDriver;
+import eu.wohlben.qits.cd.registry.StubRegistry;
+import io.quarkus.test.common.TestResourceScope;
+import io.quarkus.test.common.WithTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
 import jakarta.inject.Inject;
@@ -23,6 +26,7 @@ import org.junit.jupiter.api.Test;
  * than asserting the whole document: the suite shares one database and other classes deploy too.
  */
 @QuarkusTest
+@WithTestResource(value = StubRegistry.class, scope = TestResourceScope.GLOBAL)
 public class CdPinApiTest {
 
   private static final String SHA_A = "a".repeat(40);
@@ -35,6 +39,7 @@ public class CdPinApiTest {
   @BeforeEach
   void reset() {
     driver.reset();
+    StubRegistry.reset();
   }
 
   @Test
@@ -42,8 +47,8 @@ public class CdPinApiTest {
     // Two environments running one application name, each a rollback step deep: the entry carries
     // all four shas, because either environment's next restart pulls its own serving sha and either
     // rollback pulls its own predecessor.
-    String staging = createEnvironment("pins-staging", "repo-pins", "app-pins");
-    String live = createEnvironment("pins-live", "repo-pins", "app-pins");
+    String staging = createEnvironment("pins-staging");
+    String live = createEnvironment("pins-live");
 
     deploy("repo-pins", "environment/pins-staging", SHA_A, staging, 1);
     deploy("repo-pins", "environment/pins-staging", SHA_B, staging, 2);
@@ -52,7 +57,7 @@ public class CdPinApiTest {
 
     // Serving shas sorted, then rollback shas sorted — a union over environments has no recency to
     // order by, so the answer is stable rather than pretending to be a sequence.
-    assertEquals(List.of(SHA_B, SHA_D, SHA_A, SHA_C), shasOf("app-pins"));
+    assertEquals(List.of(SHA_B, SHA_D, SHA_A, SHA_C), shasOf("repo-pins"));
   }
 
   @Test
@@ -62,40 +67,40 @@ public class CdPinApiTest {
     // (CdDeploymentFlowTest.aFailedGateRestartsWhatTheCutoverStopped). The pins say exactly that —
     // the serving sha, and no rollback target, because nothing ever served before it. The failed
     // sha is pinned by nothing: no container was created from it.
-    String environmentId = createEnvironment("pins-gate", "repo-pins-gate", "app-pins-gate");
+    String environmentId = createEnvironment("pins-gate");
     deploy("repo-pins-gate", "environment/pins-gate", SHA_A, environmentId, 1);
 
     driver.scriptHealth(new DeploymentDriver.HealthResult(false, "container exited"));
     deploy("repo-pins-gate", "environment/pins-gate", SHA_B, environmentId, 2);
 
-    assertEquals(List.of(SHA_A), shasOf("app-pins-gate"));
+    assertEquals(List.of(SHA_A), shasOf("repo-pins-gate"));
   }
 
   @Test
   public void aCutoverMovesThePinsExactlyOneStep() {
     // Three green builds in a row: the newest serves, the one before it is the rollback target, and
     // the oldest is pinned by nothing — one rollback step is what cd can actually perform.
-    String environmentId = createEnvironment("pins-steps", "repo-pins-steps", "app-pins-steps");
+    String environmentId = createEnvironment("pins-steps");
     deploy("repo-pins-steps", "environment/pins-steps", SHA_A, environmentId, 1);
     deploy("repo-pins-steps", "environment/pins-steps", SHA_B, environmentId, 2);
 
-    assertEquals(List.of(SHA_B, SHA_A), shasOf("app-pins-steps"));
+    assertEquals(List.of(SHA_B, SHA_A), shasOf("repo-pins-steps"));
 
     deploy("repo-pins-steps", "environment/pins-steps", SHA_C, environmentId, 3);
 
-    assertEquals(List.of(SHA_C, SHA_B), shasOf("app-pins-steps"));
+    assertEquals(List.of(SHA_C, SHA_B), shasOf("repo-pins-steps"));
   }
 
   @Test
   public void anApplicationThatNeverDeployedIsAbsentRatherThanEmpty() {
     // An environment created and nothing green yet: there is no serving sha, so there is no entry.
     // An empty one would read as "this name is pinned" to a collector that keeps what it is told.
-    createEnvironment("pins-idle", "repo-pins-idle", "app-pins-idle");
+    createEnvironment("pins-idle");
 
     assertEquals(
         List.of(),
         pins().stream()
-            .filter(pin -> "app-pins-idle".equals(pin.get("applicationName")))
+            .filter(pin -> "repo-pins-idle".equals(pin.get("applicationName")))
             .toList());
   }
 
@@ -112,10 +117,10 @@ public class CdPinApiTest {
     return given().when().get("/cd/api/pins").then().statusCode(200).extract().jsonPath().getList("pins");
   }
 
-  private String createEnvironment(String name, String repoId, String appName) {
+  private String createEnvironment(String name) {
     return given()
         .contentType(ContentType.JSON)
-        .body(Map.of("name", name, "applications", List.of(Map.of("repoId", repoId, "name", appName))))
+        .body(Map.of("name", name))
         .when()
         .post("/cd/api/environments")
         .then()
