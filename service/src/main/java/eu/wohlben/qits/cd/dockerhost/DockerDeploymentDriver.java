@@ -219,7 +219,7 @@ public class DockerDeploymentDriver implements DeploymentDriver {
   }
 
   @Override
-  public void connect(String network, String container, String alias) {
+  public ConnectResult connect(String network, String container, String alias) {
     List<String> argv = new ArrayList<>(List.of(runtime, "network", "connect"));
     if (alias != null && !alias.isBlank()) {
       argv.add("--alias");
@@ -228,10 +228,31 @@ public class DockerDeploymentDriver implements DeploymentDriver {
     argv.add(network);
     argv.add(container);
     CdProcess.Result result = CdProcess.run(null, argv, CLEANUP_TIMEOUT, 8192);
-    if (result.exitCode() != 0) {
-      // Already-joined answers non-zero and is the normal outcome of the pre-deploy self-heal.
-      LOG.debugf("Could not join %s to '%s': %s", container, network, result.output());
+    if (result.exitCode() == 0 && !result.timedOut()) {
+      return new ConnectResult(true, null);
     }
+    String output = result.output() == null ? "" : result.output();
+    if (alreadyJoined(output)) {
+      // The normal outcome of the self-heal, and of re-reconciling a network somebody is already
+      // on: docker changed nothing and the container is where the caller wanted it.
+      LOG.debugf("%s was already on '%s'", container, network);
+      return new ConnectResult(true, null);
+    }
+    LOG.warnf("Could not join %s to '%s': %s", container, network, output);
+    return new ConnectResult(false, output);
+  }
+
+  /**
+   * Whether docker's refusal was "it is already there". Measured against the platform's own daemon
+   * (29.5.3): {@code endpoint with name <container> already exists in network <network>}. The
+   * second wording is the one older daemons answer with. Brittle by nature, so it errs the safe
+   * way: an unrecognised refusal is a failed join, never a false "already fine". Package-private
+   * for the test that pins both wordings.
+   */
+  static boolean alreadyJoined(String output) {
+    String lowered = output.toLowerCase(Locale.ROOT);
+    return lowered.contains("already exists in network")
+        || lowered.contains("is already connected to network");
   }
 
   @Override
@@ -350,12 +371,17 @@ public class DockerDeploymentDriver implements DeploymentDriver {
     if (ids.isEmpty()) {
       return List.of();
     }
-    // One inspect for all of them: id|name|every alias the container holds anywhere. A container's
-    // own name always resolves on a user-defined network, so it counts as an alias here — that is
-    // what lets a replace cutover absorb a predecessor the bootstrap started outside cd. The
-    // aliases are read across all networks rather than one: the containers were already filtered
-    // to the networks that matter, and a predecessor that holds the alias on the legacy network
-    // alone is exactly the one this has to find.
+    // One inspect for all of them: id|name|every alias the container holds anywhere|its
+    // environment. A container's own name always resolves on a user-defined network, so it counts
+    // as an alias here — that is what lets a replace cutover absorb a predecessor the bootstrap
+    // started outside cd. The aliases are read across all networks rather than one: the containers
+    // were already filtered to the networks that matter, and a predecessor that holds the alias on
+    // the legacy network alone is exactly the one this has to find.
+    //
+    // The environment is read by RANGING over the labels rather than with `index`, which is not a
+    // style choice: measured on docker 29.5.3, an `index` of an empty label map that FOLLOWS the
+    // alias ranges above prints `<no value>` — which would read back as an environment id no
+    // environment has. The range form answers empty, which is what an unlabelled container means.
     List<String> inspect =
         new ArrayList<>(
             List.of(
@@ -363,7 +389,10 @@ public class DockerDeploymentDriver implements DeploymentDriver {
                 "inspect",
                 "--format",
                 "{{.Id}}|{{.Name}}|{{range $net, $conf := .NetworkSettings.Networks}}"
-                    + "{{range $conf.Aliases}}{{.}} {{end}}{{end}}"));
+                    + "{{range $conf.Aliases}}{{.}} {{end}}{{end}}|"
+                    + "{{range $key, $value := .Config.Labels}}{{if eq $key \""
+                    + ENVIRONMENT_LABEL
+                    + "\"}}{{$value}}{{end}}{{end}}"));
     inspect.addAll(ids);
     CdProcess.Result inspected = CdProcess.run(null, inspect, CLEANUP_TIMEOUT, outputMaxChars);
     if (inspected.exitCode() != 0) {
@@ -380,22 +409,35 @@ public class DockerDeploymentDriver implements DeploymentDriver {
         .toList();
   }
 
-  /** Package-private for the parsing test: one `id|/name|alias alias ...` line per container. */
+  /** Package-private for the parsing test: one `id|/name|alias alias ...|env` line per container. */
   static List<Holder> parseHolders(String inspectOutput, String alias) {
     List<Holder> holders = new ArrayList<>();
     for (String line : (inspectOutput == null ? "" : inspectOutput).split("\\R")) {
-      String[] parts = line.trim().split("\\|", 3);
+      String[] parts = line.trim().split("\\|", 4);
       if (parts.length < 2) {
         continue;
       }
       String name = parts[1].startsWith("/") ? parts[1].substring(1) : parts[1];
       boolean aliased =
-          parts.length == 3 && Arrays.asList(parts[2].trim().split("\\s+")).contains(alias);
+          parts.length >= 3 && Arrays.asList(parts[2].trim().split("\\s+")).contains(alias);
       if (name.equals(alias) || aliased) {
-        holders.add(new Holder(parts[0], name));
+        holders.add(new Holder(parts[0], name, environmentOf(parts)));
       }
     }
     return List.copyOf(holders);
+  }
+
+  /**
+   * The environment field of an inspect line, or null when the container carries none. {@code <no
+   * value>} is treated as none as well: the format avoids producing it, and a belt here is cheaper
+   * than an environment id no environment has reaching a predecessor decision.
+   */
+  private static String environmentOf(String[] parts) {
+    if (parts.length < 4) {
+      return null;
+    }
+    String value = parts[3].trim();
+    return value.isEmpty() || "<no value>".equals(value) ? null : value;
   }
 
   @Override

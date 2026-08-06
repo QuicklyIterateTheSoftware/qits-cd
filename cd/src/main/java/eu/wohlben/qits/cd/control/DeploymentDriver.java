@@ -68,8 +68,19 @@ public interface DeploymentDriver {
   /** Every network cd labelled — the membership bookkeeping, read back from the runtime. */
   List<Network> networks();
 
-  /** Join the container to the network under the alias. Already joined is not an error. */
-  void connect(String network, String container, String alias);
+  /**
+   * Join the container to the network under the alias.
+   *
+   * <p><b>Already joined counts as joined.</b> Docker answers an existing endpoint with a non-zero
+   * exit and a message naming it, and telling that apart from a refusal is this seam's job — the
+   * wording is docker's, so it is matched where docker's other wordings are matched. Everything
+   * else is a real failure and is reported as one: a membership the caller asked for and did not
+   * get leaves a container nobody can address, which no health gate can see.
+   */
+  ConnectResult connect(String network, String container, String alias);
+
+  /** Whether the container is on the network now, and what docker said when it is not. */
+  record ConnectResult(boolean joined, String detail) {}
 
   /** Leave the network. Not being on it is not an error. */
   void disconnect(String network, String container);
@@ -100,6 +111,11 @@ public interface DeploymentDriver {
    * network included. That breadth is what finds a predecessor still living on the old topology: a
    * container started before per-application networks existed holds its alias on {@code qits-net}
    * and nowhere else, and a search of the new networks alone would start a second copy beside it.
+   *
+   * <p>The breadth is also why each holder reports the environment it belongs to: the legacy
+   * network is shared by every tier, so the union sees another environment's copy of the same
+   * application under the same alias. Deciding which of them is a predecessor is the caller's, and
+   * {@link Holder#environmentId()} is what it decides on.
    */
   List<Holder> aliasHolders(List<String> networks, String alias);
 
@@ -147,8 +163,17 @@ public interface DeploymentDriver {
   /** Remove every container labelled as belonging to the environment. Returns how many there were. */
   int removeEnvironmentContainers(String environmentId);
 
-  /** One container holding an application's alias: the full docker id and the container name. */
-  record Holder(String id, String name) {}
+  /**
+   * One container holding an application's alias: the full docker id, the container name, and the
+   * environment it was started for.
+   *
+   * <p>{@code environmentId} is the container's {@value #ENVIRONMENT_LABEL} label and is <b>null
+   * for two very different containers</b>: a singleton, which belongs to no tier by design, and a
+   * container from before cd labelled anything — a compose original, or one the previous cd
+   * started. Both are adoptable by whoever is deploying, which is why they share the null: a
+   * predecessor nobody has claimed is claimed by the deployment that finds it.
+   */
+  record Holder(String id, String name, String environmentId) {}
 
   /**
    * Everything one container is started with.

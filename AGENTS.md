@@ -71,12 +71,25 @@ The directories are `cd/` and `service/`; the artifactIds are `qits-cd-domain` a
 
 ## The worker
 
-`DeployService` runs every deployment on a single-threaded daemon worker (`cd-deploy-worker`), the
-`CiRunService` shape: the intake returns immediately, each DB transition sits in its own
-`QuarkusTransaction.requiringNew()` bracket, and everything the docker calls need is copied out of
-the entities into a plain `Plan` record first — the worker thread has no request context and no
-open session. Serial execution is load-bearing beyond simplicity: it is what makes "the previous
-ACTIVE deployment" an uncontended read during cutover.
+`DeployService` runs **the whole of a build-succeeded event** on a single-threaded daemon worker
+(`cd-deploy-worker`), the `CiRunService` shape: the intake validates and returns, each DB transition
+sits in its own `QuarkusTransaction.requiringNew()` bracket, and everything the docker calls need is
+copied out of the entities into a plain `Plan` record first — the worker thread has no request
+context and no open session.
+
+Serial execution is load-bearing twice over, and the second one is why *registration* is on the
+worker rather than on the request thread where it started:
+
+- it makes "the previous ACTIVE deployment" an uncontended read during cutover;
+- it makes derived registration's read-then-write atomic. "Is there a row for this repository yet,
+  and if not, make one" has no database constraint behind it for a **singleton** — its
+  `environment_id` is null and a composite unique index treats nulls as distinct — so two green
+  builds of one repository arriving together would each read "no singleton" and each write one. The
+  worker is the lock. `twoIdenticalEventsArrivingTogetherRegisterOneSingleton` holds it.
+
+The cost is that the spec's HTTP read sits in the queue too; `qits.cd.git-host-timeout-seconds`
+bounds it. `awaitIdle()` is public for the suite, because "nothing was registered" can only be
+asserted after the worker has had the event.
 
 Transactions are programmatic everywhere in `control`, not `@Transactional` — partly for the
 worker, partly because a `this.`-invocation never crosses the interceptor and a lost bracket fails
@@ -109,6 +122,12 @@ brought up to date from it. Three consequences worth holding on to:
   deployments move onto the singleton, the active ones decommissioned, the old rows go. That
   conversion is a one-time live migration (idp and cd) and the reason it moves rather than deletes
   is `sweepInFlight`: a `STARTING` self-update row must survive cd's own conversion.
+- **The conversion runs one way only.** A repository that is already a singleton and whose spec goes
+  back to `environment` is REFUSED, with a `FAILED` row on the singleton naming the flip and an
+  ERROR log — not converted. There is no answer to which of the environments tracking the branch
+  inherits the history, and the environment deployment would find the running singleton through the
+  legacy network and remove it, leaving a row that says `ACTIVE` about nothing. Going back is an
+  operator's deliberate act, not a build's.
 
 The two planes are the whole of `CdDeploymentTarget`. A **singleton** has no environment (null
 column, no `qits.cd.environment` label, no `QITS_ENVIRONMENT`, `deployment.environment.name=platform`),
@@ -134,10 +153,26 @@ Two things to leave alone unless you mean it:
 - **`aliasHolders` searches the union** of every network the fresh container will be on, legacy one
   included. Narrow it and a deploy starts a second copy beside a container that holds its alias on
   `qits-net` alone — which is every container on the platform until it has been redeployed once.
+- **...and the union is then filtered by the holder's `qits.cd.environment`**, which is the other
+  half of the same thought. The legacy network is shared by every tier, so the union also returns
+  another environment's healthy copy of the same application under the same alias; stopping that
+  would be one tier reaching into another. A holder labelled with THIS environment is the
+  predecessor, one labelled with another is left alone, and an **unlabelled** one stays adoptable —
+  that null is both a singleton and a container from before cd labelled anything, and adopting it is
+  the whole migration. A singleton keeps only the unlabelled ones: no tier's container is the
+  platform plane's predecessor.
+- **A join cd asked for and did not get FAILS the deployment.** `docker network connect` reports
+  "already there" as an error, so the driver tells that wording apart from a refusal and only the
+  refusal counts. It has to fail the deployment rather than warn: the health gate curls localhost
+  *inside* the container, so it passes perfectly well on a network nobody else is on, and the
+  cutover would then remove the predecessor under an unreachable successor. The reconciliation's
+  joins stay best-effort — those are a self-heal, not this deployment's own reachability.
 - **`qits.cd.legacy-network`** (default `qits-net`, `Optional<String>` because SmallRye reads an
   empty value as absent) is the transition membership. **Emptying it is the enforcement flip**, a
   later phase that needs every direct cross-application URL migrated to a gateway route first.
-  `LegacyNetworkOffTest` already runs that posture.
+  `LegacyNetworkOffTest` already runs that posture. An environment teardown never disconnects
+  anything from it and never removes it, even when it IS that environment's bundle — which is
+  exactly the dev tier's shape.
 
 ## The cutover invariant
 

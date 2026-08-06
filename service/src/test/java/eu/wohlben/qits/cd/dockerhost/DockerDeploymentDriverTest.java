@@ -1,6 +1,7 @@
 package eu.wohlben.qits.cd.dockerhost;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -223,17 +224,58 @@ class DockerDeploymentDriverTest {
   @Test
   void aliasHolderParsingMatchesByNameOrAliasAndStripsTheLeadingSlash() {
     // docker inspect emits /name; a container's own name resolves on the network, so name==alias
-    // counts (the compose-seeded case) as does an explicit --network-alias (cd's own case).
+    // counts (the compose-seeded case) as does an explicit --network-alias (cd's own case). The
+    // fourth field is the environment label, and it decides whose predecessor the holder is.
     String output =
-        "aaa111|/qits-gateway|qits-gateway abc\n"
-            + "bbb222|/qits-cd-qits-qits-gateway-12345678|qits-gateway\n"
-            + "ccc333|/unrelated|other-alias\n";
+        "aaa111|/qits-gateway|qits-gateway abc|\n"
+            + "bbb222|/qits-cd-dev-qits-gateway-12345678|qits-gateway|env-1\n"
+            + "ccc333|/unrelated|other-alias|env-1\n";
     List<DeploymentDriver.Holder> holders =
         DockerDeploymentDriver.parseHolders(output, "qits-gateway");
     assertEquals(
         List.of(
-            new DeploymentDriver.Holder("aaa111", "qits-gateway"),
-            new DeploymentDriver.Holder("bbb222", "qits-cd-qits-qits-gateway-12345678")),
+            new DeploymentDriver.Holder("aaa111", "qits-gateway", null),
+            new DeploymentDriver.Holder("bbb222", "qits-cd-dev-qits-gateway-12345678", "env-1")),
+        holders);
+  }
+
+  @Test
+  void dockerSayingTheContainerIsAlreadyOnTheNetworkIsNotAFailedJoin() {
+    // The whole of what separates "the self-heal found nothing to do" from "this container is not
+    // on a network it needs and no health gate will notice". The first wording is measured against
+    // the platform's own daemon (29.5.3); the second is what older daemons answer.
+    assertTrue(
+        DockerDeploymentDriver.alreadyJoined(
+            "Error response from daemon: endpoint with name qits-cd-dev-qits-gateway-1234abcd"
+                + " already exists in network qits-net"));
+    assertTrue(
+        DockerDeploymentDriver.alreadyJoined(
+            "Error response from daemon: container abc is already connected to network qits-net"));
+    // Anything else is a real refusal — the match errs toward failing the deployment.
+    assertFalse(
+        DockerDeploymentDriver.alreadyJoined(
+            "Error response from daemon: network qits-net not found"));
+    assertFalse(DockerDeploymentDriver.alreadyJoined(""));
+  }
+
+  @Test
+  void anUnlabelledHolderReportsNoEnvironmentWhateverDockerPrints() {
+    // The container from before the labels existed is the one the migration adopts, so "no
+    // environment" has to survive every spelling docker has for it: a missing field (an older
+    // format), an empty one, and the `<no value>` a Go template prints for an absent map key —
+    // measured on docker 29.5.3, where an `index` following the alias ranges produces exactly that.
+    List<DeploymentDriver.Holder> holders =
+        DockerDeploymentDriver.parseHolders(
+            "aaa111|/qits-gateway|qits-gateway|<no value>\n"
+                + "bbb222|/seeded|qits-gateway|\n"
+                + "ccc333|/older-format|qits-gateway\n",
+            "qits-gateway");
+
+    assertEquals(
+        List.of(
+            new DeploymentDriver.Holder("aaa111", "qits-gateway", null),
+            new DeploymentDriver.Holder("bbb222", "seeded", null),
+            new DeploymentDriver.Holder("ccc333", "older-format", null)),
         holders);
   }
 

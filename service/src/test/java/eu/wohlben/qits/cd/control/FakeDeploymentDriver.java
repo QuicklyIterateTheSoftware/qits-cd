@@ -56,6 +56,9 @@ public class FakeDeploymentDriver implements DeploymentDriver {
   private final List<Endpoint> singletons = Collections.synchronizedList(new ArrayList<>());
   private final List<String> aliasSearches = Collections.synchronizedList(new ArrayList<>());
 
+  /** Networks docker refuses to join, by name — what a real join failure looks like to cd. */
+  private final java.util.Map<String, String> refusedJoins = new java.util.concurrent.ConcurrentHashMap<>();
+
   public void reset() {
     ensuredNetworks.clear();
     removedNetworks.clear();
@@ -82,6 +85,12 @@ public class FakeDeploymentDriver implements DeploymentDriver {
     hubs.clear();
     singletons.clear();
     aliasSearches.clear();
+    refusedJoins.clear();
+  }
+
+  /** Script docker refusing to join anything to this network, with that message. */
+  public void scriptRefusedJoin(String network, String detail) {
+    refusedJoins.put(network, detail);
   }
 
   /** Networks docker already has when the test starts — ensureNetwork answers "not created". */
@@ -204,9 +213,11 @@ public class FakeDeploymentDriver implements DeploymentDriver {
   }
 
   @Override
-  public void connect(String network, String container, String alias) {
+  public ConnectResult connect(String network, String container, String alias) {
     calls.add("connect:" + network + ":" + container + ":" + alias);
     connections.add(network + ":" + container + ":" + alias);
+    String refusal = refusedJoins.get(network);
+    return refusal == null ? new ConnectResult(true, null) : new ConnectResult(false, refusal);
   }
 
   @Override

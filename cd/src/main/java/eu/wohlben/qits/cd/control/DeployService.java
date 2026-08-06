@@ -178,27 +178,49 @@ public class DeployService {
   }
 
   /**
-   * The async entry the build-succeeded intake calls — returns immediately with how many
-   * deployments were recorded (zero when nothing listens to the branch, which is the normal case
-   * for every push to a branch no environment tracks and not worth an error).
+   * The async entry the build-succeeded intake calls. It validates, hands the event to the worker
+   * and returns — the sender is fire-and-forget and has nothing to do with the answer.
    *
-   * <p>The spec read happens here, synchronously, because it decides <b>which rows exist</b> —
-   * there is nothing to queue until it has answered. A read that fails (the git host is down, the
-   * file does not parse) does not guess: the applications already registered for this (repo,
-   * branch) each get a recorded {@code FAILED} deployment naming the cause, and a repository with
-   * no rows yet gets nothing, exactly as an unknown repository always has.
+   * <p><b>The whole event runs on the worker, registration included</b>, and that placement is the
+   * concurrency contract rather than a detail. Derived registration is a read-then-write — "is
+   * there a row for this repository yet, and if not, make one" — and a singleton row is the one
+   * shape no database constraint can guard, because its {@code environment_id} is null and a
+   * composite unique index treats nulls as distinct. Two green builds of one repository arriving
+   * together would each read "no singleton" and each write one. The worker is single-threaded, so
+   * putting the read and the write on it is what makes the pair atomic against every other event —
+   * the same reason the cutover lives there, applied to the rows instead of the containers.
    *
    * <p>{@code runId} is optional and is recorded on every row this queues, verbatim: it is the only
    * pointer from a deployment back to the build that caused it, and cd resolves it against nothing —
    * a reader takes it to qits-ci. The triple that actually drives the deployment is still (repoId,
    * branch, commitSha).
    */
-  public int onBuildSucceeded(String runId, String repoId, String branch, String commitSha) {
+  public void onBuildSucceeded(String runId, String repoId, String branch, String commitSha) {
     CdIdentifiers.requireRunId(runId);
     CdIdentifiers.requireRepoId(repoId);
     CdIdentifiers.requireBranch(branch);
     CdIdentifiers.requireSha(commitSha);
+    worker.submit(
+        () -> {
+          try {
+            deploy(runId, repoId, branch, commitSha);
+          } catch (RuntimeException e) {
+            LOG.errorf(e, "The build-succeeded event for %s@%s could not be handled", repoId, commitSha);
+          }
+        });
+  }
 
+  /**
+   * One build-succeeded event, start to finish, on the worker thread: read what the repository
+   * declares, bring the rows it addresses up to date, and deploy each.
+   *
+   * <p>The spec read comes first because it decides <b>which rows exist</b> — there is nothing to
+   * queue until it has answered. A read that fails (the git host is down, the file does not parse)
+   * does not guess: the applications already registered for this (repo, branch) each get a recorded
+   * {@code FAILED} deployment naming the cause, and a repository with no rows yet gets nothing,
+   * exactly as an unknown repository always has.
+   */
+  private void deploy(String runId, String repoId, String branch, String commitSha) {
     DeploymentSpec spec = null;
     String specFailure = null;
     try {
@@ -209,34 +231,33 @@ public class DeployService {
     }
 
     List<String> applicationIds =
-        spec == null ? alreadyRegistered(repoId, branch) : register(repoId, branch, spec);
+        spec == null
+            ? alreadyRegistered(repoId, branch)
+            : register(runId, repoId, branch, commitSha, spec);
     List<String> queued = queue(runId, commitSha, applicationIds);
 
     if (specFailure != null) {
       for (String deploymentId : queued) {
         finish(deploymentId, CdDeploymentStatus.FAILED, specFailure);
       }
-      return queued.size();
+      return;
     }
     for (String deploymentId : queued) {
-      worker.submit(
-          () -> {
-            try {
-              execute(deploymentId);
-            } catch (RuntimeException e) {
-              LOG.errorf(e, "Deployment %s failed unexpectedly", deploymentId);
-              finish(deploymentId, CdDeploymentStatus.FAILED, "[unexpected: " + e + "]");
-            }
-          });
+      try {
+        execute(deploymentId);
+      } catch (RuntimeException e) {
+        LOG.errorf(e, "Deployment %s failed unexpectedly", deploymentId);
+        finish(deploymentId, CdDeploymentStatus.FAILED, "[unexpected: " + e + "]");
+      }
     }
-    return queued.size();
   }
 
   /**
    * Bring the rows this build addresses up to date with what the repository declares, and answer
    * which applications to deploy. The whole of derived registration.
    */
-  private List<String> register(String repoId, String branch, DeploymentSpec spec) {
+  private List<String> register(
+      String runId, String repoId, String branch, String commitSha, DeploymentSpec spec) {
     if (!isDeployableName(repoId)) {
       // The application name is the image path segment and the network alias, so it has to be a
       // dns label. A repository whose id is not one cannot be deployed by convention at all, and
@@ -249,10 +270,43 @@ public class DeployService {
             () ->
                 spec.target() == CdDeploymentTarget.SINGLETON
                     ? registerSingleton(repoId, branch, spec)
-                    : registerInEnvironments(repoId, branch, spec));
+                    : registerInEnvironments(runId, repoId, branch, commitSha, spec));
   }
 
-  private List<String> registerInEnvironments(String repoId, String branch, DeploymentSpec spec) {
+  /**
+   * The environment half. A repository that is <b>already a singleton</b> is refused here rather
+   * than registered: the two planes are not symmetric, and going back is not a conversion.
+   *
+   * <p>Coming the other way, environment rows become the singleton because there is exactly one
+   * destination to move them to. A singleton going back has as many destinations as there are
+   * environments tracking the branch, no answer to which of them inherits the deployment history,
+   * and a running container on {@code qits-platform} that the environment deployment would find
+   * through the legacy network and remove — leaving a singleton row that says {@code ACTIVE} about
+   * a container that no longer exists. So this refuses, loudly and on the record: an operator
+   * deletes the singleton row's plane deliberately, or the file goes back to what it said.
+   */
+  private List<String> registerInEnvironments(
+      String runId, String repoId, String branch, String commitSha, DeploymentSpec spec) {
+    Optional<CdApplication> singleton = applications.findSingletonByRepo(repoId);
+    if (singleton.isPresent()) {
+      LOG.errorf(
+          "%s is registered as a platform singleton and its deployments.yml now asks for"
+              + " deployment_target: environment. Going back is not a conversion and was refused —"
+              + " remediate deliberately (retire the singleton, then push again).",
+          repoId);
+      recordRejection(
+          singleton.get(),
+          runId,
+          commitSha,
+          "[refused: "
+              + repoId
+              + " is a platform singleton and this commit asks for deployment_target:"
+              + " environment. cd converts an environment application into a singleton, never the"
+              + " reverse — there is no one environment to inherit the history and the running"
+              + " singleton would be removed by the first environment deployment. Retire the"
+              + " singleton deliberately, then push again.]");
+      return List.of();
+    }
     List<String> ids = new ArrayList<>();
     for (CdEnvironment environment : environments.listByBranch(branch)) {
       CdApplication application =
@@ -331,6 +385,26 @@ public class DeployService {
       LOG.infof("Converted %s from an environment application to the platform singleton", repoId);
     }
     return List.of(singleton.id);
+  }
+
+  /**
+   * A refused registration, written down where the operator will look for it: one {@code FAILED}
+   * deployment on the row that already exists. A log line alone would say the same thing to nobody
+   * — the intake is fire-and-forget, so the row is the only surface a refusal can surface on.
+   * Called inside the registration transaction.
+   */
+  private void recordRejection(
+      CdApplication application, String runId, String commitSha, String detail) {
+    CdDeployment rejected = new CdDeployment();
+    rejected.id = UUID.randomUUID().toString();
+    rejected.application = application;
+    rejected.commitSha = commitSha;
+    rejected.runId = runId;
+    rejected.status = CdDeploymentStatus.FAILED;
+    rejected.detail = detail;
+    rejected.createdAt = Instant.now();
+    rejected.finishedAt = Instant.now();
+    deployments.persist(rejected);
   }
 
   /** What a failed spec read falls back to: the rows this (repo, branch) already had. */
@@ -492,7 +566,8 @@ public class DeployService {
     searchNetworks.add(primaryNetwork);
     searchNetworks.addAll(joins);
     List<DeploymentDriver.Holder> predecessors =
-        driver.aliasHolders(List.copyOf(searchNetworks), plan.applicationName());
+        predecessorsOf(
+            driver.aliasHolders(List.copyOf(searchNetworks), plan.applicationName()), plan);
     String self = driver.selfContainerId();
     DeploymentDriver.Holder selfHolder =
         self.isBlank()
@@ -517,7 +592,15 @@ public class DeployService {
         finish(deploymentId, CdDeploymentStatus.FAILED, safe(successor.detail()));
         return;
       }
-      join(containerName, plan.applicationName(), joins);
+      String unjoined = join(containerName, plan.applicationName(), joins);
+      if (unjoined != null) {
+        // No handoff: the referee would promote a successor no caller can address, and it would do
+        // it by removing the instance that still works. Nothing was stopped yet, so dropping the
+        // successor puts everything back.
+        driver.remove(containerName);
+        finish(deploymentId, CdDeploymentStatus.FAILED, unjoined);
+        return;
+      }
       reconcile(plan, primaryNetwork);
       driver.handoff(
           new DeploymentDriver.HandoffSpec(
@@ -543,7 +626,18 @@ public class DeployService {
     // docker on every deployment rather than remembered — which makes this the self-heal too: a
     // membership lost to a manual `network disconnect` or to a network that did not exist last
     // time is simply back on the replacement.
-    join(containerName, plan.applicationName(), joins);
+    //
+    // A membership the deployment asked for and did not get is a FAILED deployment, not a warning.
+    // The health gate cannot catch it — it curls localhost inside the container, which answers
+    // perfectly well from a network nobody else is on — so an unreachable container would go ACTIVE
+    // and the predecessor would be removed under it. This is the same rollback a failed gate takes.
+    String unjoined = join(containerName, plan.applicationName(), joins);
+    if (unjoined != null) {
+      driver.remove(containerName);
+      rollback(predecessors);
+      finish(deploymentId, CdDeploymentStatus.FAILED, unjoined);
+      return;
+    }
     reconcile(plan, primaryNetwork);
 
     DeploymentDriver.HealthResult health =
@@ -657,10 +751,55 @@ public class DeployService {
     return List.copyOf(joins);
   }
 
-  private void join(String containerName, String alias, List<String> networks) {
+  /**
+   * Put the fresh container on every network it needs beyond its primary one.
+   *
+   * @return null when it is on all of them, or the failure to record on the deployment row —
+   *     these joins are what makes the container addressable, so a refused one is not a warning
+   */
+  private String join(String containerName, String alias, List<String> networks) {
     for (String network : networks) {
-      driver.connect(network, containerName, alias);
+      DeploymentDriver.ConnectResult joined = driver.connect(network, containerName, alias);
+      if (!joined.joined()) {
+        return "could not join " + containerName + " to '" + network + "'\n" + safe(joined.detail());
+      }
     }
+    return null;
+  }
+
+  /**
+   * Which of the containers answering to this alias this deployment may replace.
+   *
+   * <p>The alias search is a union that includes the legacy network, and the legacy network is
+   * shared by every tier — so it also returns another environment's copy of the same application,
+   * holding the same alias, perfectly healthy. Stopping that one would be a deployment of one tier
+   * silently taking a container out of another, which is what the environment label prevents:
+   *
+   * <ul>
+   *   <li>a holder labelled with <b>this</b> environment is this deployment's own predecessor;
+   *   <li>a holder labelled with <b>another</b> environment belongs to that tier and is left alone;
+   *   <li>a holder with <b>no</b> label is unclaimed — a compose original, a container the previous
+   *       cd started, or a singleton — and stays adoptable, because that is the whole of how this
+   *       platform migrates onto per-application networks.
+   * </ul>
+   *
+   * <p>A singleton keeps only the unlabelled ones, which by the same rule means singletons and
+   * unclaimed originals: a container that carries an environment id belongs to a tier, and no tier's
+   * container is the platform plane's predecessor.
+   */
+  private static List<DeploymentDriver.Holder> predecessorsOf(
+      List<DeploymentDriver.Holder> holders, Plan plan) {
+    List<DeploymentDriver.Holder> mine = new ArrayList<>();
+    for (DeploymentDriver.Holder holder : holders) {
+      if (holder.environmentId() == null || holder.environmentId().equals(plan.environmentId())) {
+        mine.add(holder);
+      } else {
+        LOG.debugf(
+            "%s holds the alias %s for environment %s — not this deployment's predecessor",
+            holder.name(), plan.applicationName(), holder.environmentId());
+      }
+    }
+    return List.copyOf(mine);
   }
 
   /**
@@ -751,8 +890,12 @@ public class DeployService {
     return newline < 0 ? trimmed : trimmed.substring(0, newline);
   }
 
-  /** Test hook: waits for the work queued at this moment to drain. */
-  void awaitIdle() throws Exception {
+  /**
+   * Test hook: waits for the work queued at this moment to drain. Public because the whole of an
+   * event now runs on the worker — registration included — so a suite that asserts "nothing was
+   * registered" has to be able to wait for the worker rather than for a row that never appears.
+   */
+  public void awaitIdle() throws Exception {
     worker.submit(() -> {}).get();
   }
 }

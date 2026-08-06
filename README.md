@@ -53,7 +53,10 @@ and the line.
   branch. Registering as one **converts** whatever environment-scoped rows the repository had: their
   deployment history moves onto the singleton, the active ones decommissioned, and the old rows go.
   qits-idp and qits-cd are the singletons — an identity provider each tier mints its own tokens
-  from, or a deployer that deploys only its own tier, would be a different platform.
+  from, or a deployer that deploys only its own tier, would be a different platform. The conversion
+  is one-way: a singleton whose file goes back to `environment` is refused with a `FAILED` row
+  naming the flip, because there is no one environment to inherit its history and the environment
+  deployment would remove the running singleton on its way in. Retiring a singleton is deliberate.
 - No environment listens to the branch and it is not a matching singleton ⇒ 202 and nothing, which
   is the normal case for most pushes.
 
@@ -124,6 +127,11 @@ neither instance referees its own succession.
   Two environments' stacks still cannot resolve each other's aliases — the documented
   two-stacks-collide-on-`qits-net` failure — and now neither can two applications of one
   environment, unless one of them is a hub.
+- **A teardown never takes the legacy network with it.** An environment may have been created with
+  `qits.cd.legacy-network` as its bundle — dev is exactly that, its bundle is `qits-net` — and that
+  network is the whole host's, not the tier's. Deleting the environment skips both the singleton
+  disconnects and the `network rm` for it, and still removes the environment's derived
+  per-application networks.
 - **The transition network keeps today's URLs resolving.** Every fresh container also joins
   `qits.cd.legacy-network` (default `qits-net`) while the platform still holds direct
   cross-application URLs that have not moved to gateway routes. It is also what lets the
@@ -141,6 +149,17 @@ neither instance referees its own succession.
   singleton to the application's network — a fresh network has nobody on it, and one that outlived
   a deployment that failed to start has nobody on it either, so the set is recomputed rather than
   joined once.
+- **A predecessor is scoped to its environment.** Whatever holds the application's alias on any of
+  the networks the fresh container will be on is its predecessor — unless it carries *another*
+  environment's `qits.cd.environment` label, because the legacy network is shared by every tier and
+  a deployment of one tier must not stop another's container. A container with no label at all stays
+  adoptable: that is a compose original or one an older cd started, and adopting it is how the
+  platform migrates. A singleton adopts only unlabelled holders.
+- **An unreachable container is a failed deployment.** The joins after `docker run` are what make
+  the container addressable, and the health gate cannot see them — it curls localhost inside the
+  container. So a join docker refuses (as opposed to "already joined", which it also reports as an
+  error and which is fine) removes the fresh container, restarts the predecessor and records
+  `FAILED` with docker's own words.
 - **The network alias is the application name** and stays stable across deployments while
   container names (`qits-cd-<env>-<app>-<deployment-prefix>`, or `qits-cd-singleton-<app>-<prefix>`)
   do not. Peers address each other by application name, exactly as the platform's compose files do.

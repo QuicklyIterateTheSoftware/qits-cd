@@ -300,6 +300,48 @@ public class CdEnvironmentApiTest {
   }
 
   @Test
+  public void teardownLeavesTheLegacyNetworkAloneWhenItIsTheEnvironmentsBundle() {
+    // The dev tier's shape exactly: its bundle IS qits.cd.legacy-network. That network is the
+    // transition membership of every container on the host — singletons included — so it is not
+    // this environment's to take away. Disconnecting the singletons from it would cut qits-idp and
+    // qits-cd off from the platform, and cd would be doing it to itself mid-request.
+    String environmentId =
+        given()
+            .contentType(ContentType.JSON)
+            .body(Map.of("name", "env-legacy-bundle", "network", "qits-net"))
+            .when()
+            .post("/cd/api/environments")
+            .then()
+            .statusCode(201)
+            .body("environment.network", equalTo("qits-net"))
+            .extract()
+            .path("environment.id");
+    driver.reset();
+    driver.scriptExistingNetwork(
+        new eu.wohlben.qits.cd.control.DeploymentDriver.Network(
+            "qits-env-env-legacy-bundle-app-y",
+            environmentId,
+            eu.wohlben.qits.cd.control.DeploymentDriver.NetworkKind.APPLICATION,
+            "app-y"));
+    driver.scriptSingletonContainers(
+        List.of(new eu.wohlben.qits.cd.control.DeploymentDriver.Endpoint("cd-id", "qits-cd")));
+
+    given().when().delete("/cd/api/environments/" + environmentId).then().statusCode(204);
+
+    assertTrue(
+        driver.disconnections().stream().noneMatch(d -> d.startsWith("qits-net:")),
+        "no singleton is taken off the legacy network: " + driver.disconnections());
+    assertTrue(
+        !driver.removedNetworks().contains("qits-net"),
+        "and the legacy network itself stays: " + driver.removedNetworks());
+    // The environment's OWN derived network still goes, singleton disconnected from it first.
+    assertTrue(
+        driver.disconnections().contains("qits-env-env-legacy-bundle-app-y:cd-id"),
+        driver.disconnections().toString());
+    assertTrue(driver.removedNetworks().contains("qits-env-env-legacy-bundle-app-y"));
+  }
+
+  @Test
   public void teardownRemovesRowsContainersAndNetwork() {
     String environmentId =
         given()

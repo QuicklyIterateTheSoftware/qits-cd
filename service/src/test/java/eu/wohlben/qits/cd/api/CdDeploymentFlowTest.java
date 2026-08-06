@@ -7,10 +7,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import eu.wohlben.qits.cd.control.CdSpecSource;
+import eu.wohlben.qits.cd.control.DeployService;
 import eu.wohlben.qits.cd.control.DeploymentDriver;
 import eu.wohlben.qits.cd.control.FakeDeploymentDriver;
 import eu.wohlben.qits.cd.control.FakeSpecSource;
+import eu.wohlben.qits.cd.entity.CdDeployment;
 import eu.wohlben.qits.cd.entity.CdDeploymentTarget;
+import eu.wohlben.qits.cd.persistence.CdDeploymentRepository;
+import io.quarkus.narayana.jta.QuarkusTransaction;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
 import jakarta.inject.Inject;
@@ -36,6 +40,8 @@ public class CdDeploymentFlowTest {
 
   @Inject FakeDeploymentDriver driver;
   @Inject FakeSpecSource specs;
+  @Inject DeployService deployService;
+  @Inject CdDeploymentRepository deployments;
 
   @BeforeEach
   void reset() {
@@ -96,6 +102,35 @@ public class CdDeploymentFlowTest {
       }
     }
     return fail("deployments of " + environmentId + " did not settle to " + count);
+  }
+
+  /**
+   * Drain the worker. A build-succeeded event is handled there in one piece — spec read,
+   * registration, queueing, deployment — so "nothing happened" is only assertable once the worker
+   * has had the event and finished with it. No sleep: the hook queues a no-op behind the work and
+   * waits on it.
+   */
+  private void awaitWorkerIdle() {
+    try {
+      deployService.awaitIdle();
+    } catch (Exception e) {
+      throw new IllegalStateException("the deploy worker did not drain", e);
+    }
+  }
+
+  /**
+   * A singleton's deployments are unreachable through the environment-scoped listing, so a test
+   * about one reads the row directly — the same thing CdSweepAdoptionTest does for the same reason.
+   */
+  private CdDeployment deploymentOf(String applicationId, String sha) {
+    return QuarkusTransaction.requiringNew()
+        .call(
+            () ->
+                deployments.listByApplication(applicationId).stream()
+                    .filter(d -> sha.equals(d.commitSha))
+                    .findFirst()
+                    .orElseThrow(
+                        () -> new AssertionError("no deployment of " + applicationId + " at " + sha)));
   }
 
   /** Singletons have no environment to read deployments through — wait on the driver instead. */
@@ -221,7 +256,7 @@ public class CdDeploymentFlowTest {
     // The predecessor here is NOT one of cd's own rows — it is whatever holds the alias, which is
     // how the compose-seeded originals hand over to cd on their first pipeline deployment.
     String environmentId = createEnvironment("flow-replace", "repo-replace", "app-replace");
-    driver.scriptAliasHolders(List.of(new DeploymentDriver.Holder("c0ffee".repeat(10) + "beef", "seeded-original")));
+    driver.scriptAliasHolders(List.of(new DeploymentDriver.Holder("c0ffee".repeat(10) + "beef", "seeded-original", null)));
     postBuildSucceeded("repo-replace", "environment/flow-replace", SHA_A);
 
     List<Map<String, Object>> deployments = awaitDeployments(environmentId, 1);
@@ -240,7 +275,7 @@ public class CdDeploymentFlowTest {
   @Test
   public void aFailedGateRestartsWhatTheCutoverStopped() {
     String environmentId = createEnvironment("flow-rollback", "repo-rollback", "app-rollback");
-    driver.scriptAliasHolders(List.of(new DeploymentDriver.Holder("dead".repeat(16), "previous-app")));
+    driver.scriptAliasHolders(List.of(new DeploymentDriver.Holder("dead".repeat(16), "previous-app", null)));
     driver.scriptHealth(new DeploymentDriver.HealthResult(false, "container exited"));
     postBuildSucceeded("repo-rollback", "environment/flow-rollback", SHA_A);
 
@@ -261,7 +296,7 @@ public class CdDeploymentFlowTest {
     String selfId = "abcdef123456";
     String selfFullId = selfId + "f".repeat(52);
     driver.scriptSelfId(selfId);
-    driver.scriptAliasHolders(List.of(new DeploymentDriver.Holder(selfFullId, "qits-cd")));
+    driver.scriptAliasHolders(List.of(new DeploymentDriver.Holder(selfFullId, "qits-cd", null)));
     postBuildSucceeded("repo-self", "environment/flow-self", SHA_A);
 
     long deadline = System.currentTimeMillis() + 15_000;
@@ -308,7 +343,7 @@ public class CdDeploymentFlowTest {
     String selfId = "abcdef123456";
     String selfFullId = selfId + "f".repeat(52);
     driver.scriptSelfId(selfId);
-    driver.scriptAliasHolders(List.of(new DeploymentDriver.Holder(selfFullId, "qits-cd")));
+    driver.scriptAliasHolders(List.of(new DeploymentDriver.Holder(selfFullId, "qits-cd", null)));
     postBuildSucceeded("qits-cd", "main", SHA_A);
 
     long deadline = System.currentTimeMillis() + 15_000;
@@ -343,6 +378,7 @@ public class CdDeploymentFlowTest {
     postBuildSucceeded("repo-other", "main", SHA_A);
 
     // 202 (fire-and-forget sender), but nothing was queued or pulled.
+    awaitWorkerIdle();
     awaitDeployments(environmentId, 0);
     assertEquals(List.of(), driver.pulledRefs());
   }
@@ -512,6 +548,87 @@ public class CdDeploymentFlowTest {
   }
 
   @Test
+  public void anUnlabelledAliasHolderIsAdoptedAsThePredecessor() {
+    // The migration case, stated as its own test: a container the previous cd (or the bootstrap's
+    // compose) started carries no environment label at all, and it is exactly the one a deployment
+    // has to replace rather than run beside.
+    String environmentId = createEnvironment("flow-adopt", "repo-adopt", "repo-adopt");
+    driver.scriptAliasHolders(
+        List.of(new DeploymentDriver.Holder("aa".repeat(32), "seeded-original", null)));
+    postBuildSucceeded("repo-adopt", "environment/flow-adopt", SHA_A);
+
+    awaitDeployments(environmentId, 1);
+    assertEquals(List.of("seeded-original"), driver.stoppedContainers());
+    assertTrue(driver.removedContainers().contains("seeded-original"));
+  }
+
+  @Test
+  public void anAliasHolderOfThisEnvironmentIsReplacedAndOneOfAnotherIsLeftAlone() {
+    // The union search covers the legacy network, and every tier is on it — so it returns another
+    // environment's copy of the same application, healthy, under the same alias. Stopping that one
+    // would be a deployment of one tier reaching into another; the environment label is what keeps
+    // this deployment to its own.
+    String environmentId = createEnvironment("flow-scope", "repo-scope", "repo-scope");
+    driver.scriptAliasHolders(
+        List.of(
+            new DeploymentDriver.Holder("bb".repeat(32), "mine", environmentId),
+            new DeploymentDriver.Holder("cc".repeat(32), "another-tiers", "some-other-env-id")));
+    postBuildSucceeded("repo-scope", "environment/flow-scope", SHA_A);
+
+    awaitDeployments(environmentId, 1);
+    assertEquals(List.of("mine"), driver.stoppedContainers(), "only this environment's copy");
+    assertTrue(driver.removedContainers().contains("mine"));
+    assertTrue(
+        driver.stoppedContainers().stream().noneMatch("another-tiers"::equals)
+            && driver.removedContainers().stream().noneMatch("another-tiers"::equals),
+        "the other tier's container is untouched: " + driver.calls());
+  }
+
+  @Test
+  public void aSingletonNeverTakesAnEnvironmentsContainerAsItsPredecessor() {
+    // A singleton belongs to no tier, so a container that carries a tier's id is never its
+    // predecessor — while an unlabelled one still is, because that is what its own live migration
+    // off the legacy network depends on.
+    specs.script(
+        "repo-plane", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null));
+    driver.scriptAliasHolders(
+        List.of(
+            new DeploymentDriver.Holder("dd".repeat(32), "an-env-copy", "some-env-id"),
+            new DeploymentDriver.Holder("ee".repeat(32), "the-old-unlabelled-one", null)));
+    postBuildSucceeded("repo-plane", "main", SHA_A);
+
+    awaitStarted(1);
+    awaitWorkerIdle();
+    assertEquals(List.of("the-old-unlabelled-one"), driver.stoppedContainers());
+    assertTrue(
+        driver.removedContainers().stream().noneMatch("an-env-copy"::equals),
+        "the environment's container is not the platform plane's to take: " + driver.calls());
+  }
+
+  @Test
+  public void aRefusedJoinFailsTheDeploymentAndPutsThePredecessorBack() {
+    // The health gate curls localhost INSIDE the container, so it passes just as happily on a
+    // network nobody else is on: a join cd asked for and did not get can only be caught here. The
+    // rollback is the failed-gate one — the fresh container goes, the predecessor serves again.
+    String environmentId = createEnvironment("flow-nojoin", "repo-nojoin", "repo-nojoin");
+    driver.scriptAliasHolders(
+        List.of(new DeploymentDriver.Holder("ff".repeat(32), "still-serving", environmentId)));
+    driver.scriptRefusedJoin("qits-net", "Error response from daemon: network qits-net not found");
+    postBuildSucceeded("repo-nojoin", "environment/flow-nojoin", SHA_A);
+
+    List<Map<String, Object>> deployments = awaitDeployments(environmentId, 1);
+    assertEquals("FAILED", deployments.get(0).get("status"));
+    assertTrue(
+        ((String) deployments.get(0).get("detail")).contains("network qits-net not found"),
+        "docker's own words are on the row: " + deployments.get(0).get("detail"));
+    String fresh = driver.started().get(0).containerName();
+    assertTrue(driver.removedContainers().contains(fresh), "the fresh container was removed");
+    assertEquals(List.of("still-serving"), driver.restartedContainers());
+    // Never gated: an unreachable container has nothing to prove.
+    assertEquals(List.of(), driver.awaited());
+  }
+
+  @Test
   public void thePredecessorSearchCoversTheLegacyNetworkTooDuringTheMigration() {
     // The union IS the migration: today's containers hold their alias on qits-net and on no
     // per-application network at all, so a search of the new networks alone would start a second
@@ -570,6 +687,101 @@ public class CdDeploymentFlowTest {
             .jsonPath()
             .getList("deployments")
             .size());
+  }
+
+  @Test
+  public void flippingASingletonBackToAnEnvironmentIsRefusedOnTheRecord() {
+    // The conversion runs one way only. Coming back has no answer to "which environment inherits
+    // the history", and the environment deployment would find the running singleton through the
+    // legacy network and remove it — leaving a singleton row saying ACTIVE about nothing. So it is
+    // refused, and the refusal is written where an operator looks: a FAILED row on the singleton.
+    createEnvironment("flow-unflip", "repo-unflip-seed", "app-unflip-seed");
+    specs.script(
+        "repo-unflip", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null));
+    postBuildSucceeded("repo-unflip", "main", SHA_A);
+    awaitStarted(1);
+
+    // The file goes back to saying `environment`, on the tier's own branch this time.
+    specs.script(
+        "repo-unflip", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.ENVIRONMENT, false, null));
+    postBuildSucceeded("repo-unflip", "environment/flow-unflip", SHA_B);
+    awaitWorkerIdle();
+
+    // Nothing was registered into the environment and nothing new was deployed.
+    List<Map<String, Object>> rows =
+        given()
+            .when()
+            .get("/cd/api/applications")
+            .then()
+            .statusCode(200)
+            .extract()
+            .jsonPath()
+            .<Map<String, Object>>getList("applications")
+            .stream()
+            .filter(a -> "repo-unflip".equals(a.get("repoId")))
+            .toList();
+    assertEquals(1, rows.size(), "still one row, still the singleton: " + rows);
+    assertEquals("SINGLETON", rows.get(0).get("target"));
+    assertEquals(1, driver.started().size(), "the refused build started nothing");
+
+    // ...and the refusal is on the record, naming the flip.
+    CdDeployment refused = deploymentOf(rows.get(0).get("id").toString(), SHA_B);
+    assertEquals("FAILED", refused.status.name());
+    assertTrue(
+        refused.detail.contains("deployment_target: environment"),
+        "the detail names the flip: " + refused.detail);
+    assertTrue(
+        refused.detail.contains("Retire the singleton deliberately"),
+        "and says what to do about it: " + refused.detail);
+  }
+
+  @Test
+  public void twoIdenticalEventsArrivingTogetherRegisterOneSingleton() {
+    // Derived registration is a read-then-write, and a singleton row is the one shape no database
+    // constraint can guard: its environment_id is null, and a composite unique index treats nulls
+    // as distinct. Handling the whole event on cd's single worker is what makes the pair atomic.
+    specs.script(
+        "repo-once", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null));
+    int senders = 8;
+    java.util.concurrent.ExecutorService pool =
+        java.util.concurrent.Executors.newFixedThreadPool(senders);
+    java.util.concurrent.CountDownLatch go = new java.util.concurrent.CountDownLatch(1);
+    List<java.util.concurrent.Future<?>> sent = new java.util.ArrayList<>();
+    try {
+      for (int i = 0; i < senders; i++) {
+        sent.add(
+            pool.submit(
+                () -> {
+                  go.await();
+                  postBuildSucceeded("repo-once", "main", SHA_A);
+                  return null;
+                }));
+      }
+      go.countDown(); // every sender is parked on the latch, so they enter the intake together
+      for (java.util.concurrent.Future<?> one : sent) {
+        one.get();
+      }
+    } catch (Exception e) {
+      throw new IllegalStateException("the concurrent senders failed", e);
+    } finally {
+      pool.shutdownNow();
+    }
+    awaitWorkerIdle();
+
+    List<Map<String, Object>> rows =
+        given()
+            .when()
+            .get("/cd/api/applications")
+            .then()
+            .statusCode(200)
+            .extract()
+            .jsonPath()
+            .<Map<String, Object>>getList("applications")
+            .stream()
+            .filter(a -> "repo-once".equals(a.get("repoId")))
+            .toList();
+    assertEquals(1, rows.size(), "one singleton row for one repository: " + rows);
+    assertEquals("SINGLETON", rows.get(0).get("target"));
   }
 
   @Test

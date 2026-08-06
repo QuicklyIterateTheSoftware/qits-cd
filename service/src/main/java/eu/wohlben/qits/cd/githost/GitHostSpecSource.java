@@ -43,20 +43,42 @@ public class GitHostSpecSource implements CdSpecSource {
   @ConfigProperty(name = "qits.cd.git-host-timeout-seconds")
   long timeoutSeconds;
 
+  /**
+   * One client for the life of the process, the sibling's arrangement (qits-ci's {@code
+   * HttpGitConfigSource} holds one too). A {@code HttpClient} owns a selector thread and a
+   * connection pool, so building one per green build spends both on a single request; built lazily
+   * because the timeout it is configured with is a config value, and config is not injected yet
+   * when the field initialiser would run.
+   */
+  private volatile HttpClient client;
+
+  private HttpClient client() {
+    HttpClient existing = client;
+    if (existing == null) {
+      synchronized (this) {
+        existing = client;
+        if (existing == null) {
+          existing =
+              HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(timeoutSeconds)).build();
+          client = existing;
+        }
+      }
+    }
+    return existing;
+  }
+
   @Override
   public DeploymentSpec read(String repoId, String sha) {
     String url =
         trimTrailingSlash(gitHostUrl) + "/git/" + repoId + "/blob/" + sha + "/" + SPEC_PATH;
     HttpResponse<String> response;
     try {
-      HttpClient client =
-          HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(timeoutSeconds)).build();
       HttpRequest request =
           HttpRequest.newBuilder(URI.create(url))
               .timeout(Duration.ofSeconds(timeoutSeconds))
               .GET()
               .build();
-      response = client.send(request, HttpResponse.BodyHandlers.ofString());
+      response = client().send(request, HttpResponse.BodyHandlers.ofString());
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       throw new CdSpecException("interrupted while reading " + url, e);

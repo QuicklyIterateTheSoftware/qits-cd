@@ -15,8 +15,10 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 /**
@@ -57,6 +59,16 @@ public class EnvironmentService {
   @Inject CdApplicationRepository applications;
   @Inject CdDeploymentRepository deployments;
   @Inject DeploymentDriver driver;
+
+  /**
+   * The transition network every container also joins ({@link DeployService}). Read here for one
+   * reason only: a teardown must never take it down. See {@link #delete}.
+   *
+   * <p>{@code Optional} for the same reason it is there — SmallRye reads the enforcement flip's own
+   * empty value as ABSENT rather than as an empty string.
+   */
+  @ConfigProperty(name = "qits.cd.legacy-network")
+  Optional<String> legacyNetwork;
 
   /**
    * One application of a creation request.
@@ -169,15 +181,29 @@ public class EnvironmentService {
    * endpoint on it. They are disconnected first, and only the networks THIS environment owns (its
    * bundle plus everything labelled with its id) are removed, so a singleton keeps every other
    * environment it serves.
+   *
+   * <p><b>The legacy network is never one of them.</b> An environment may have been created with
+   * {@code qits.cd.legacy-network} as its bundle — the dev tier IS that case, its bundle is
+   * {@code qits-net} — and it is not that environment's to take away: it is the transition
+   * membership of every container on the host, singletons included. Disconnecting singletons from
+   * it would cut qits-idp and qits-cd off from the platform, and cd would be doing it to itself
+   * mid-request. So it is skipped for both steps, and the environment's derived per-application
+   * networks still go.
    */
   public void delete(String environmentId) {
     CdEnvironment environment = require(environmentId);
+    String legacy = legacyNetwork.map(String::strip).filter(n -> !n.isEmpty()).orElse(null);
     Set<String> networks = new LinkedHashSet<>();
     networks.add(environment.network);
     for (DeploymentDriver.Network network : driver.networks()) {
       if (environmentId.equals(network.environmentId())) {
         networks.add(network.name());
       }
+    }
+    if (networks.remove(legacy)) {
+      LOG.infof(
+          "Environment %s was on the legacy network '%s' — left in place, it is the platform's",
+          environment.name, legacy);
     }
     QuarkusTransaction.requiringNew()
         .run(
