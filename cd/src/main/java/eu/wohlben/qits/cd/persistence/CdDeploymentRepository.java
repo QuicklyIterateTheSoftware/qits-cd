@@ -27,6 +27,11 @@ public class CdDeploymentRepository implements PanacheRepositoryBase<CdDeploymen
         "select d from CdDeployment d join fetch d.application order by d.createdAt desc, d.id desc");
   }
 
+  /** Every deployment of one application row — what a conversion moves onto the singleton. */
+  public List<CdDeployment> listByApplication(String applicationId) {
+    return list("application.id = ?1", applicationId);
+  }
+
   /** The application's currently serving deployment(s) — by invariant at most one. */
   public List<CdDeployment> listActiveByApplication(String applicationId) {
     return list("application.id = ?1 and status = ?2", applicationId, CdDeploymentStatus.ACTIVE);

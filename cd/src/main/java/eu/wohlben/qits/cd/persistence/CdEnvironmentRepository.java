@@ -18,4 +18,12 @@ public class CdEnvironmentRepository implements PanacheRepositoryBase<CdEnvironm
   public List<CdEnvironment> listNewestFirst() {
     return list("order by createdAt desc, id desc");
   }
+
+  /**
+   * Every environment listening to exactly this branch — what derived registration fans a green
+   * build out over. Usually one; two tiers may legitimately track the same ref.
+   */
+  public List<CdEnvironment> listByBranch(String branch) {
+    return list("branch = ?1 order by createdAt, id", branch);
+  }
 }

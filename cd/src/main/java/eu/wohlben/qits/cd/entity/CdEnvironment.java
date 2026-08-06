@@ -8,13 +8,13 @@ import jakarta.persistence.Table;
 import java.time.Instant;
 
 /**
- * One deployment environment: a name (by convention the epic slug), the branch whose green builds
- * deploy into it, and the docker network its containers share. Created over the environment surface
- * by whatever orchestrates an epic (qits-projects), torn down the same way.
+ * One deployment environment — a <b>tier</b>: dev, preprod, prod. A name, the branch whose green
+ * builds deploy into it, and the docker network its public nodes share. Created deliberately over
+ * the environment surface; a tier is not something a build invents.
  *
- * <p>The environment does not know an epic id — cd lives in its own physical DB with NO FK into any
- * other context's tables, and the name/branch pair is the whole contract. The applications it
- * tracks are {@link CdApplication} rows; deployments hang off those.
+ * <p>The applications it holds are {@link CdApplication} rows, and those are <b>derived</b>: a
+ * green build on {@link #branch} registers or updates the repository's application here. Nothing
+ * declares them over the API.
  */
 @Entity
 @Table(name = "cd_environment")
@@ -28,16 +28,17 @@ public class CdEnvironment extends PanacheEntityBase {
 
   /**
    * The branch this environment listens to. A build-succeeded event deploys here exactly when its
-   * branch equals this value — convention fills it as {@code epic/<name>} when the creator names
-   * none.
+   * branch equals this value — convention fills it as {@code environment/<name>} when the creator
+   * names none.
    */
   @Column(nullable = false)
   public String branch;
 
   /**
-   * The docker network this environment's containers join — one network per environment, so two
-   * environments' stacks can never resolve each other's aliases (the documented
-   * two-stacks-collide-on-qits-net failure, avoided by construction).
+   * This environment's <b>bundle</b> network: the one its public nodes ({@code availableOnEnv})
+   * share. It is not where an ordinary application runs — each application gets its own derived
+   * {@code qits-env-<env>-<app>} network, and the public nodes join all of them. Derived networks
+   * are never persisted; docker's own labels are the bookkeeping.
    */
   @Column(nullable = false)
   public String network;

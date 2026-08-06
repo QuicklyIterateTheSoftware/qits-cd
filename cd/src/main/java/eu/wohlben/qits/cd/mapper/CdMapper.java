@@ -18,6 +18,12 @@ public interface CdMapper {
   @Mapping(target = "applications", ignore = true)
   CdEnvironmentDto toDto(CdEnvironment entity);
 
+  // The environment is flattened rather than nested: a singleton has none, and a listing that
+  // mixes both wants one shape. `target` is the entity's `deploymentTarget` — the dto says what
+  // the field is, the column says whose.
+  @Mapping(target = "environmentId", source = "environment.id")
+  @Mapping(target = "environmentName", source = "environment.name")
+  @Mapping(target = "target", source = "deploymentTarget")
   CdApplicationDto toDto(CdApplication entity);
 
   @Mapping(target = "applicationId", source = "application.id")
