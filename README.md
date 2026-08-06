@@ -5,22 +5,57 @@ convention that turns a green build into a running container.
 
 ## What it does
 
-An **environment** is a name (by convention an epic's slug), a branch, a docker network, and the
-applications it tracks. The intended lifecycle, end to end:
+An **environment** is a **tier** — dev, preprod, prod: a name, the branch whose green builds deploy
+into it, and the docker network its public nodes share. Tiers are created deliberately; what they
+hold is not. The lifecycle, end to end:
 
-1. qits-projects starts an epic and creates an environment here — `POST /cd/api/environments`
-   with the epic's slug and the participating repositories. Conventions fill the rest: the branch
-   is `epic/<name>`, the network is `qits-env-<name>`.
-2. Pushes to `epic/<name>` reach the git host, qits-ci builds them, and on a green run notifies
-   this service — `POST /cd/api/events/build-succeeded` with `{runId, repoId, branch, commitSha}`.
-3. cd matches (repoId, branch) against its environments. For each tracked application it records a
-   deployment — carrying `runId` verbatim, the row's one pointer back at the build that caused it
-   (`/ci/runs/<runId>`); cd resolves it against nothing and it is null on every row recorded before
-   the column existed — and, on its worker: derives the image reference by convention
-   (`<registry>/qits/<application>:<sha>`), pulls it, starts it on the environment's network with a
-   docker-native health gate, and — only once the fresh container reports healthy — decommissions
-   the container it replaces.
-4. Epic done, qits-projects deletes the environment: rows, containers, network.
+1. Someone creates the tier — `POST /cd/api/environments` with a name. Conventions fill the rest:
+   the branch is `environment/<name>`, the bundle network is `qits-env-<name>`. No applications are
+   named; there is no write for them.
+2. Pushes to `environment/<name>` reach the git host, qits-ci builds them, and on a green run
+   notifies this service — `POST /cd/api/events/build-succeeded` with
+   `{runId, repoId, branch, commitSha}`.
+3. cd reads the repository's own `.config/qits/deployments.yml` at that sha from the git host, and
+   **derives the registration** from it (see below): the application row is created or brought up
+   to date in every place the spec addresses. For each it records a deployment — carrying `runId`
+   verbatim, the row's one pointer back at the build that caused it (`/ci/runs/<runId>`); cd
+   resolves it against nothing and it is null on every row recorded before the column existed — and,
+   on its worker: derives the image reference by convention (`<registry>/qits/<application>:<sha>`),
+   pulls it, starts it on its own network with a docker-native health gate, joins it to everything
+   else it belongs on, and — only once the fresh container reports healthy — decommissions the
+   container it replaces.
+4. Tier retired, someone deletes the environment: rows, containers, its bundle and every network
+   derived from it.
+
+**Registration is derived, and that file is the whole of it.** Nothing declares an application over
+the API — a repository states how it is deployed and a green build is what makes the statement take
+effect:
+
+```yaml
+deployment_target: environment   # default when the key or the file is absent | singleton
+available_on_env: false          # default; true = public node (bundle + hub joins)
+branch: main                     # singleton only: the branch that deploys it (default main)
+```
+
+Read with `GET <qits.cd.git-host-url>/git/<repoId>/blob/<sha>/.config/qits/deployments.yml` — the
+same blob contract qits-ci reads a pipeline definition through. **A 404 is an answer**: no file
+means every default, so every repository without one behaves exactly as it did before the file
+existed. Any other failure — the git host down, a 500, a file that does not parse — **fails the
+deployment** with the cause in its `detail`. cd never guesses a topology, because a guess puts a
+container on the wrong networks under the wrong name. The parser is strict for the same reason: an
+unknown key, a repeated key, a value outside the enum and a public singleton (`available_on_env`
+with `singleton` — it already runs on every environment's networks) are all errors naming the file
+and the line.
+
+- `deployment_target: environment` — the row is ensured in **every environment whose branch matches
+  the build's**, named after the repository.
+- `deployment_target: singleton` — one instance for the whole platform, deployed from its own
+  branch. Registering as one **converts** whatever environment-scoped rows the repository had: their
+  deployment history moves onto the singleton, the active ones decommissioned, and the old rows go.
+  qits-idp and qits-cd are the singletons — an identity provider each tier mints its own tokens
+  from, or a deployer that deploys only its own tier, would be a different platform.
+- No environment listens to the branch and it is not a matching singleton ⇒ 202 and nothing, which
+  is the normal case for most pushes.
 
 A deployment that goes wrong is a recorded outcome, never a broken environment:
 
@@ -38,12 +73,14 @@ what was stopped, so the previous deployment stays `ACTIVE` and serving. Stop-be
 rather than the overlapping cutover this service first shipped — is what makes stateful
 applications deployable at all: one process per H2 file, one binder per published host port. The
 pull happens before the stop, so even the registry's own application can be replaced. The
-predecessor is *whatever holds the application's alias* on the environment's network, including
-containers cd did not start — which is how a bootstrap's compose-seeded originals hand themselves
-over to cd on their first pipeline deployment.
+predecessor is *whatever holds the application's alias* on **any network the fresh container is
+about to be on** — the legacy one included — whoever started it. That breadth is what lets a
+bootstrap's compose-seeded originals hand themselves over on their first pipeline deployment, and
+what makes the move onto per-application networks safe: a container that holds its alias on
+`qits-net` alone is still the predecessor, so no deploy ever starts a second copy beside it.
 
 **Self-update is a handoff**, because the one predecessor cd never stops in-process is its own
-container. Deploying `qits-cd` splits the cutover three ways: this instance starts the successor
+container — and cd is itself a singleton, so this is the path its every release takes. Deploying `qits-cd` splits the cutover three ways: this instance starts the successor
 (which retries on the H2 lock under its restart policy) and launches a detached **referee** — a
 `--rm` container of the deployment's own image with the entrypoint swapped for the shell — then
 returns with the row left `STARTING`. The referee stops the predecessor (freeing the lock),
@@ -66,12 +103,46 @@ neither instance referees its own succession.
   Publishing is a repository's own last pipeline step (a `docker: true` step in qits-ci, tagging
   exactly this reference), so `IMAGE_MISSING` means that repository's pipeline publishes nothing or
   its tag broke the convention — not that nothing can publish.
-- **One network per environment** (`qits-env-<name>`): two environments' stacks must never resolve
-  each other's aliases. This is the documented two-stacks-collide-on-`qits-net` failure, avoided by
-  construction rather than by discipline.
+- **Hub and spoke, not one flat network per environment.** Three shapes, and every name is derived
+  — no network membership is ever stored in a row:
+
+  | network | who is on it |
+  |---|---|
+  | `qits-env-<env>-<app>` | one application of one environment: its own containers, plus the joins below |
+  | `<env.network>` (the **bundle**, `qits-env-<env>` by convention) | that environment's public nodes |
+  | `qits-platform` | the singletons |
+
+  `docker run` takes exactly one network — the application's own, or `qits-platform` — and
+  everything else is a `docker network connect --alias <app>` after the start. A public node
+  (`available_on_env: true`, today just qits-gateway) joins its environment's bundle **and every
+  per-application network of that environment**: that is the hub, and it is how an application
+  reaches the gateway and how the gateway proxies every application. All cross-application traffic
+  is meant to flow app → gateway → the target's public API. A **singleton joins every
+  per-application network of every environment**, which is what makes it locally reachable
+  everywhere and is why idp and cd need no gateway route for intra-platform callers.
+
+  Two environments' stacks still cannot resolve each other's aliases — the documented
+  two-stacks-collide-on-`qits-net` failure — and now neither can two applications of one
+  environment, unless one of them is a hub.
+- **The transition network keeps today's URLs resolving.** Every fresh container also joins
+  `qits.cd.legacy-network` (default `qits-net`) while the platform still holds direct
+  cross-application URLs that have not moved to gateway routes. It is also what lets the
+  compose-managed bootstrap hand containers over without a flag day, and what makes the predecessor
+  search find containers that live on `qits-net` alone. **Emptying that key is the enforcement
+  flip** — a later phase: from then on an application is reachable only through its own network, a
+  hub join or a gateway route, and a URL nobody migrated fails loudly instead of resolving.
+- **Docker's labels are the membership bookkeeping**, never a table. Networks carry
+  `qits.cd.network=bundle|application|platform`, `qits.cd.environment` and (on application networks)
+  `qits.cd.app-name`; adopting a pre-existing unlabelled network such as `qits-net` stays supported.
+  Containers carry `qits.cd.environment` (absent on singletons, so an environment teardown cannot
+  take one with it), `qits.cd.application`, `qits.cd.deployment`, `qits.cd.target` and
+  `qits.cd.available-on-env`, plus `qits.cd.app-name` so a reconciliation can join a running
+  container under the right alias. When a deploy **creates** a per-application network it joins that
+  environment's public nodes and every singleton to it — the network did not exist a moment ago, so
+  nobody is on it.
 - **The network alias is the application name** and stays stable across deployments while
-  container names (`qits-cd-<env>-<app>-<deployment-prefix>`) do not. Peers inside an environment
-  address each other by application name, exactly as the platform's compose files do on qits-net.
+  container names (`qits-cd-<env>-<app>-<deployment-prefix>`, or `qits-cd-singleton-<app>-<prefix>`)
+  do not. Peers address each other by application name, exactly as the platform's compose files do.
 - **The health gate runs inside the container** (`--health-cmd` curl'ing
   `http://localhost:8080<path>`, polled via `docker inspect`): cd never joins an environment's
   network, so the probe has to live where the network is. The image contract that buys: the image
@@ -92,8 +163,10 @@ neither instance referees its own succession.
   docker keeps the last assignment of a repeated env key — so cd's variables are defaults an
   operator overrides by naming the same key, never the other way round.
 - **The container is told who it is, in OpenTelemetry's vocabulary.** Every started container gets
-  `QITS_ENVIRONMENT`, `QITS_APPLICATION`, and the resource identity the platform's logs and traces
-  are bucketed by:
+  `QITS_APPLICATION` and the resource identity the platform's logs and traces are bucketed by;
+  `QITS_ENVIRONMENT` goes to environment applications only, since a singleton is in all of them and
+  telling it that it lives in one would be a statement that is not true (its
+  `deployment.environment.name` reads `platform` for the same reason):
 
       OTEL_RESOURCE_ATTRIBUTES=service.version=<commit sha>,deployment.environment.name=<env>,service.instance.id=<container name>
       QUARKUS_OTEL_RESOURCE_ATTRIBUTES=<the same string>
@@ -112,9 +185,8 @@ neither instance referees its own succession.
   baked into the image at build time, which is the stale identity this exists to correct. Both
   variables are built from one string, so they cannot disagree, and a non-Quarkus image ignores
   the second name.
-- **Containers carry labels** (`qits.cd.environment`, `qits.cd.application`,
-  `qits.cd.deployment`), and teardown finds them by label — so even containers whose rows are gone
-  cannot be orphaned invisibly.
+- **Teardown finds containers by label**, so even containers whose rows are gone cannot be orphaned
+  invisibly.
 - **Deployed containers outlive the deployer**: `--restart unless-stopped`, and a qits-cd restart
   reaps nothing. The startup sweep fails in-flight *rows*; whatever was ACTIVE keeps serving.
 
@@ -129,8 +201,9 @@ segment is the client's.
 |---|---|---|
 | `/cd/` | GET | the Angular SPA, built from `service/src/main/webui` by Quinoa and served by this process (`quarkus.quinoa.ui-root-path`); unmatched paths under it fall back to `index.html`, so the client's own router gets its deep links — except under the prefixes below |
 | `/cd` | GET, HEAD | a 301 to `/cd/`. Quinoa mounts at `/cd/*`, which does not match the bare segment (upstream quinoa #960); `webui/WebUiRedirect` is this service's answer |
-| `/cd/api/environments` | GET, POST | list; create (machine call from the epic orchestration) |
-| `/cd/api/environments/{id}` | GET, DELETE | one environment with its applications; teardown |
+| `/cd/api/environments` | GET, POST | list; create a tier (a name is enough — `applications` is optional and deprecated) |
+| `/cd/api/environments/{id}` | GET, PATCH, DELETE | one environment with its applications; rename or retarget it (`{name?, branch?}`, no docker side effects); teardown |
+| `/cd/api/applications` | GET | every application cd deploys — the environments' and the platform's singletons, flat, each saying which plane it is on |
 | `/cd/api/deployments?environmentId=` | GET | an environment's deployments, newest-first |
 | `/cd/api/pins` | GET | the image shas deployments pin, across every environment: what serves and what a rollback restores. Read by qits-artifacts' image GC, which keeps what this names and aborts its sweep when cd cannot answer |
 | `/cd/api/events/build-succeeded` | POST | the qits-ci intake (hidden from the OpenAPI document) |
@@ -207,13 +280,14 @@ does this, for the same reason.
 - **Building or publishing images.** cd consumes the OCI registry; producing for it is the
   publisher's story. A green build with no image is `IMAGE_MISSING`, loudly.
 - **DNS wiring.** qits-dns's plan names cd as the caller that will wire
-  `<epic>.qits-dev.eu` on deploy (`PUT /dns/api/zones/{id}/records`, idempotent by design). That
+  `<environment>.qits-dev.eu` on deploy (`PUT /dns/api/zones/{id}/records`, idempotent by design). That
   is a natural next seam here — after the more basic question of how a per-environment hostname
   becomes a reachable listener (the shared gateway routes by path, not Host) is settled.
-- **The epic orchestration itself.** Creating `epic/<slug>` branches, switching a wrapper repo's
-  submodule tracking, calling this service on epic start — all of that is qits-projects' side of
-  the contract and does not exist yet; this service is the receiving half, complete and testable
-  without it.
+- **Making the branches.** cd listens to `environment/<name>`; pushing that ref is the release
+  flow's job (qits-workspaces fast-forwards `environment/dev` after a release lands on `main`), and
+  a push to `main` alone builds but deploys nothing. This service is the receiving half.
+- **Per-environment run arguments, ports and volumes.** `qits.cd.run-args.<application>` is keyed by
+  application name across every environment, which is what a second tier will need to change.
 - **A templating engine for application config.** A deployed container gets `QITS_ENVIRONMENT`,
   `QITS_APPLICATION`, its OTel resource identity, and whatever the deployment's own
   `qits.cd.run-args.<name>` names (see the

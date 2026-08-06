@@ -6,9 +6,10 @@ the conventions. This file is the working conventions on top of it.
 ## The two rules that shape everything
 
 **A clone of this repo alone builds and tests green** — no monorepo, no docker, no prior
-`mvn install` elsewhere, no credentials. That is why the poms duplicate versions instead of
-inheriting them, and why the one seam that needs real docker is faked (`FakeDeploymentDriver`, a
-scripted fake behind the `DeploymentDriver` interface) rather than skipped.
+`mvn install` elsewhere, no credentials, **no network**. That is why the poms duplicate versions
+instead of inheriting them, and why both seams that reach outside the process are faked rather than
+skipped: `FakeDeploymentDriver` behind `DeploymentDriver` (docker) and `FakeSpecSource` behind
+`CdSpecSource` (the git host).
 
 **Which command is the gate depends on whether you have the client**, and this is worth getting
 right because the clone rule now has two halves (`git clone … && git submodule update --init`):
@@ -44,15 +45,22 @@ AUTO_SERVER lesson: cd's H2 URL carries none, do not add it).
 package:
 
 - `cd/` — `entity`, `persistence`, `dto`, `mapper`, `control`, `error`. Framework-free in the
-  sense that matters: no JAX-RS, no web stack. Entities are Panache with public fields; mappers
-  are MapStruct `@Mapper(componentModel = "jakarta")`. `control` owns the two orchestrators
-  (`EnvironmentService`, `DeployService`), the validation (`CdIdentifiers`), the shell-out
-  (`CdProcess`), the image-reference convention (`ImageRefs`) and the docker seam
-  (`DeploymentDriver`).
-- `service/` — `api` (the JAX-RS routes and `CdExceptionMapper`) and `dockerhost`
-  (`DockerDeploymentDriver` — the sole implementation of the seam, kept here because it is cd's
-  whole relationship with the host's docker daemon). There is no `security` package any more: the
-  forward-auth pair moved to the published `qits-auth-core` library.
+  sense that matters: no JAX-RS, no web stack, **no HTTP client**. Entities are Panache with public
+  fields; mappers are MapStruct `@Mapper(componentModel = "jakarta")`. `control` owns the two
+  orchestrators (`EnvironmentService`, `DeployService`), the validation (`CdIdentifiers`), the
+  shell-out (`CdProcess`), the image-reference and network-name conventions (`ImageRefs`,
+  `CdNetworks`), the strict spec parser (`DeploymentSpecParser`) and the two seams
+  (`DeploymentDriver`, `CdSpecSource`).
+- `service/` — `api` (the JAX-RS routes and `CdExceptionMapper`), `dockerhost`
+  (`DockerDeploymentDriver` — the sole implementation of the docker seam, kept here because it is
+  cd's whole relationship with the host's docker daemon) and `githost` (`GitHostSpecSource`, the
+  one outbound HTTP call). There is no `security` package any more: the forward-auth pair moved to
+  the published `qits-auth-core` library.
+
+**The seam rule is one rule, applied twice.** Both things `cd/` cannot do — shell out to docker,
+fetch a file over HTTP — are interfaces there and implementations in `service/`, with a scripted
+fake in the suite. Anything that grows a third of these follows the same shape; do not put a client
+in the domain module.
 
 One package sits outside that tree: `eu.wohlben.qits.webui`, holding `WebUiRedirect` and only that.
 It keeps the sibling services' spelling rather than taking a `cd`-flavoured one, so the file is
@@ -78,6 +86,58 @@ The startup sweep (`DeployService.onStart`) fails rows left `QUEUED`/`STARTING` 
 **deliberately reaps no containers** — a deployed application outlives its deployer, and whatever
 was ACTIVE before the restart is still serving. Do not "complete" the sweep with a reap; the
 asymmetry with qits-ci (whose step containers are ephemeral by definition) is the point.
+
+## The model: tiers, derived rows, and two planes
+
+An **environment is a tier** (dev, preprod, prod), created deliberately over REST, branch
+`environment/<name>` by convention. `main` stays the integration trunk and a release reaches dev by
+fast-forwarding `environment/dev` onto it — so **a push to `main` alone builds and deploys nothing**
+except a singleton.
+
+**Application rows are derived and there is no write for them.** A green build sends cd to the
+repository's `.config/qits/deployments.yml` at that sha (`CdSpecSource`), and the row is created or
+brought up to date from it. Three consequences worth holding on to:
+
+- A repository with **no file** gets every default, so it behaves exactly as it did before the file
+  existed. That is not politeness — it is what let this change deploy onto a platform where no
+  repository had the file yet, and it is why `FakeSpecSource` answers `DEFAULTS` unless a test says
+  otherwise. Keep that default.
+- A spec that cannot be **read or parsed** fails the deployment with the cause on the row. Never add
+  a fallback that guesses: a guessed topology is a container on the wrong networks under the wrong
+  name, which is worse than a recorded failure and much harder to see.
+- `deployment_target: singleton` **converts** the repository's environment-scoped rows — their
+  deployments move onto the singleton, the active ones decommissioned, the old rows go. That
+  conversion is a one-time live migration (idp and cd) and the reason it moves rather than deletes
+  is `sweepInFlight`: a `STARTING` self-update row must survive cd's own conversion.
+
+The two planes are the whole of `CdDeploymentTarget`. A **singleton** has no environment (null
+column, no `qits.cd.environment` label, no `QITS_ENVIRONMENT`, `deployment.environment.name=platform`),
+carries its own branch, and is named `qits-cd-singleton-<app>-<id8>`. The absent label is
+load-bearing: an environment teardown reaps by it.
+
+## Networks are docker's bookkeeping, never a row
+
+Hub and spoke. An application runs on `qits-env-<env>-<app>`; a public node (`available_on_env`)
+joins its environment's bundle and every per-application network of that environment; a singleton
+runs on `qits-platform` and joins every per-application network of every environment. `docker run`
+takes one network, so everything else is a `network connect --alias <app>` after the start — and the
+join set is recomputed from docker on every deployment rather than remembered, which is what makes
+it the self-heal too.
+
+**No membership is ever stored in H2.** It is written as labels and read back with
+`--filter label=`. `qits.cd.app-name` is on containers as well as networks, and only for the
+reconciliation: joining a running container to a new network needs the alias, and the application
+*id* it already carried names a row rather than an address.
+
+Two things to leave alone unless you mean it:
+
+- **`aliasHolders` searches the union** of every network the fresh container will be on, legacy one
+  included. Narrow it and a deploy starts a second copy beside a container that holds its alias on
+  `qits-net` alone — which is every container on the platform until it has been redeployed once.
+- **`qits.cd.legacy-network`** (default `qits-net`, `Optional<String>` because SmallRye reads an
+  empty value as absent) is the transition membership. **Emptying it is the enforcement flip**, a
+  later phase that needs every direct cross-application URL migrated to a gateway route first.
+  `LegacyNetworkOffTest` already runs that posture.
 
 ## The cutover invariant
 
@@ -237,16 +297,21 @@ when the platform's Quarkus passes the version a release is built against.
   quarkus-oidc the public half, so the enforced path is exercised end to end with no qits-idp to
   reach. Those PEMs are **test fixtures, not credentials** — nothing outside the suite has ever
   seen them, and no deployment key belongs in this repo.
-- `FakeDeploymentDriver` is `@Mock` and application-scoped, so it is shared across tests: reset it
-  in `@BeforeEach`, use distinct environment names per test, and read its state through its
-  **methods** — the injected reference is a CDI client proxy, and a field read on a proxy sees the
-  proxy's fields, not the bean's. That one has already been paid for.
+- `FakeDeploymentDriver` and `FakeSpecSource` are `@Mock` and application-scoped, so they are
+  shared across tests: reset both in `@BeforeEach`, use distinct environment names **and repository
+  ids** per test, and read their state through their **methods** — the injected reference is a CDI
+  client proxy, and a field read on a proxy sees the proxy's fields, not the bean's. That one has
+  already been paid for. Registration is derived now, so a repository id is as much a test's own
+  namespace as an environment name is.
 - Flow tests poll the read surface to a deadline rather than reaching into the service — the same
-  way a caller experiences the API, and immune to the worker's timing.
+  way a caller experiences the API, and immune to the worker's timing. Singletons are the one thing
+  that surface cannot show: `/cd/api/deployments` takes an environment, and a singleton has none —
+  so those tests wait on the driver instead (`awaitStarted`) and read the row through
+  `/cd/api/applications`.
 - `OpenApiSchemaExportTest` writes `docs/openapi.yml`. Regenerate and commit when the surface
   changes: `./mvnw -pl service -am test -Dtest=OpenApiSchemaExportTest
   -Dsurefire.failIfNoSpecifiedTests=false`. The intake is `@Operation(hidden = true)` (a wire
-  API); the environment and deployment surfaces are the document. The test classpath is indexed
+  API); the environment, application and deployment surfaces are the document. The test classpath is indexed
   too, so a new `@Path` resource under `src/test` lands in the committed document unless it is
   hidden.
 - `CdPackagedSurfaceIT` runs the **packaged artifact** (fast-jar under `-DskipITs=false`, binary
