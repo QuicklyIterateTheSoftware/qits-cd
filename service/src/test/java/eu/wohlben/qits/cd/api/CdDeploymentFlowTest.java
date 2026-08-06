@@ -182,8 +182,9 @@ public class CdDeploymentFlowTest {
     assertTrue(
         driver.connections().contains("qits-net:" + containerName + ":repo-green"),
         "the fresh container joins the legacy network: " + driver.connections());
-    // No healthPath named at creation: the shipped default reaches the driver.
-    assertEquals("/q/health/ready", spec.healthPath());
+    // Nothing named a health path, so registration derived the convention one from the name — and
+    // that is what the gate curls.
+    assertEquals("/repo-green/q/health/ready", spec.healthPath());
     // Nothing was decommissioned — there was nothing before.
     assertEquals(List.of(), driver.removedContainers());
   }
@@ -344,7 +345,7 @@ public class CdDeploymentFlowTest {
     // new networks — a predecessor found on the legacy network, a successor named after the plane,
     // and still no container stopped by this process.
     specs.script(
-        "qits-cd", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null));
+        "qits-cd", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null, null));
     String selfId = "abcdef123456";
     String selfFullId = selfId + "f".repeat(52);
     driver.scriptSelfId(selfId);
@@ -430,7 +431,7 @@ public class CdDeploymentFlowTest {
             DeploymentDriver.NetworkKind.APPLICATION,
             "app-hub-seed"));
     specs.script(
-        "repo-gw", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.ENVIRONMENT, true, null));
+        "repo-gw", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.ENVIRONMENT, true, null, null));
     postBuildSucceeded("repo-gw", "environment/flow-hub", SHA_A);
 
     awaitDeployments(environmentId, 1);
@@ -457,7 +458,7 @@ public class CdDeploymentFlowTest {
             DeploymentDriver.NetworkKind.APPLICATION,
             "app-single-seed"));
     specs.script(
-        "repo-idp", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null));
+        "repo-idp", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null, null));
     // main, not the environment's branch: a singleton is platform-plane and deploys from its own.
     postBuildSucceeded("repo-idp", "main", SHA_A);
 
@@ -497,7 +498,7 @@ public class CdDeploymentFlowTest {
   public void aSingletonOnAnotherBranchDeploysNothing() {
     specs.script(
         "repo-pinned",
-        new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, "release"));
+        new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, "release", null));
     postBuildSucceeded("repo-pinned", "main", SHA_A);
     postBuildSucceeded("repo-pinned", "release", SHA_B);
 
@@ -595,7 +596,7 @@ public class CdDeploymentFlowTest {
     // predecessor — while an unlabelled one still is, because that is what its own live migration
     // off the legacy network depends on.
     specs.script(
-        "repo-plane", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null));
+        "repo-plane", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null, null));
     driver.scriptAliasHolders(
         List.of(
             new DeploymentDriver.Holder("dd".repeat(32), "an-env-copy", "some-env-id"),
@@ -658,7 +659,7 @@ public class CdDeploymentFlowTest {
     awaitDeployments(environmentId, 1);
 
     specs.script(
-        "repo-convert", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null));
+        "repo-convert", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null, null));
     postBuildSucceeded("repo-convert", "main", SHA_B);
     awaitStarted(2);
 
@@ -702,13 +703,13 @@ public class CdDeploymentFlowTest {
     // refused, and the refusal is written where an operator looks: a FAILED row on the singleton.
     createEnvironment("flow-unflip");
     specs.script(
-        "repo-unflip", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null));
+        "repo-unflip", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null, null));
     postBuildSucceeded("repo-unflip", "main", SHA_A);
     awaitStarted(1);
 
     // The file goes back to saying `environment`, on the tier's own branch this time.
     specs.script(
-        "repo-unflip", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.ENVIRONMENT, false, null));
+        "repo-unflip", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.ENVIRONMENT, false, null, null));
     postBuildSucceeded("repo-unflip", "environment/flow-unflip", SHA_B);
     awaitWorkerIdle();
 
@@ -746,7 +747,7 @@ public class CdDeploymentFlowTest {
     // constraint can guard: its environment_id is null, and a composite unique index treats nulls
     // as distinct. Handling the whole event on cd's single worker is what makes the pair atomic.
     specs.script(
-        "repo-once", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null));
+        "repo-once", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null, null));
     int senders = 8;
     java.util.concurrent.ExecutorService pool =
         java.util.concurrent.Executors.newFixedThreadPool(senders);

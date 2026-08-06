@@ -82,7 +82,7 @@ public class CdRegistryRegistrationTest {
   public void aPublicNodeIsUpsertedWithAvailableOnEnv() {
     String environmentId = createEnvironment("reg-hub", "environment/reg-hub");
     specs.script(
-        "repo-reg-gw", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.ENVIRONMENT, true, null));
+        "repo-reg-gw", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.ENVIRONMENT, true, null, null));
     postBuildSucceeded("repo-reg-gw", "environment/reg-hub", SHA_A);
     awaitStarted(1);
 
@@ -98,7 +98,7 @@ public class CdRegistryRegistrationTest {
     createEnvironment("reg-single", "environment/reg-single");
     specs.script(
         "repo-reg-idp",
-        new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, "release"));
+        new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, "release", null));
     postBuildSucceeded("repo-reg-idp", "release", SHA_A);
     awaitStarted(1);
 
@@ -106,6 +106,69 @@ public class CdRegistryRegistrationTest {
     assertEquals(CdDeploymentTarget.SINGLETON, service.target());
     assertEquals("release", service.branch());
     assertEquals(List.of(), service.environmentIds());
+  }
+
+  @Test
+  public void aRepositoryThatNamesNoHealthPathGetsTheConventionOne() {
+    // The debt this closes: registration had no source for the path, so every row was written null
+    // and every service mounted under its own prefix failed a gate against a URL that 404s.
+    createEnvironment("reg-health", "environment/reg-health");
+    postBuildSucceeded("qits-observability", "environment/reg-health", SHA_A);
+    awaitStarted(1);
+
+    assertEquals(
+        "/observability/q/health/ready",
+        StubRegistry.service("qits-observability").healthPath(),
+        "the convention is derived from the name and WRITTEN, not left for the deploy default");
+    assertEquals("/observability/q/health/ready", driver.started().get(0).healthPath());
+  }
+
+  @Test
+  public void theRepositorysOwnHealthPathWinsOverTheConvention() {
+    // The gateway owns the root path space, so the convention would send its gate to a 404.
+    createEnvironment("reg-health-gw", "environment/reg-health-gw");
+    specs.script(
+        "qits-gateway",
+        new CdSpecSource.DeploymentSpec(
+            CdDeploymentTarget.ENVIRONMENT, true, null, "/q/health/ready"));
+    postBuildSucceeded("qits-gateway", "environment/reg-health-gw", SHA_A);
+    awaitStarted(1);
+
+    assertEquals("/q/health/ready", StubRegistry.service("qits-gateway").healthPath());
+  }
+
+  @Test
+  public void anOperatorsHealthPathSurvivesAReRegistration() {
+    // A path already in the registry is somebody's fix for a service cd could not guess. A later
+    // green build that says nothing about the path must leave it alone.
+    String environmentId = createEnvironment("reg-health-keep", "environment/reg-health-keep");
+    StubRegistry.seedService(
+        new StubRegistry.Svc(
+            "qits-odd",
+            CdDeploymentTarget.ENVIRONMENT,
+            null,
+            false,
+            "/hand/placed/health",
+            List.of(environmentId),
+            Instant.now()));
+
+    postBuildSucceeded("qits-odd", "environment/reg-health-keep", SHA_A);
+    awaitStarted(1);
+
+    assertEquals("/hand/placed/health", StubRegistry.service("qits-odd").healthPath());
+  }
+
+  @Test
+  public void aSingletonGetsTheSameHealthPathResolution() {
+    // The platform plane is not a different rule: the convention, the spec and an existing value
+    // rank the same way there.
+    specs.script(
+        "qits-idp", new CdSpecSource.DeploymentSpec(CdDeploymentTarget.SINGLETON, false, null, null));
+    postBuildSucceeded("qits-idp", "main", SHA_A);
+    awaitStarted(1);
+
+    assertEquals("/idp/q/health/ready", StubRegistry.service("qits-idp").healthPath());
+    assertEquals("/idp/q/health/ready", driver.started().get(0).healthPath());
   }
 
   @Test

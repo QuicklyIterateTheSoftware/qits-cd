@@ -38,7 +38,7 @@ class DeploymentSpecParserTest {
   }
 
   @Test
-  void theThreeKeysAreReadAndCommentsAndQuotesAreNot() {
+  void theFourKeysAreReadAndCommentsAndQuotesAreNot() {
     DeploymentSpec spec =
         parse(
             """
@@ -46,11 +46,28 @@ class DeploymentSpecParserTest {
             deployment_target: singleton   # platform-plane
 
             branch: "release"
+            health_path: /idp/q/health/ready
             """);
     assertEquals(CdDeploymentTarget.SINGLETON, spec.target());
     assertEquals("release", spec.branch());
     assertEquals("release", spec.singletonBranch());
     assertFalse(spec.availableOnEnv());
+    assertEquals("/idp/q/health/ready", spec.healthPath());
+  }
+
+  @Test
+  void aFileThatNamesNoHealthPathLeavesItToTheConvention() {
+    // Null is the statement "this repository said nothing", and registration turns that into the
+    // derived path. The parser must not invent one here — it does not know the service's name.
+    assertNull(parse("available_on_env: true\n").healthPath());
+  }
+
+  @Test
+  void aHealthPathThatIsNotAnAbsolutePathIsAnError() {
+    // The value ends up in a container's --health-cmd, so it is checked as strictly as the API's.
+    assertTrue(messageOf("health_path: q/health/ready\n").contains("health_path"));
+    assertTrue(messageOf("health_path: /q/health/ready?x=1\n").contains("health_path"));
+    assertTrue(messageOf("health_path:\n").contains("health_path"));
   }
 
   @Test

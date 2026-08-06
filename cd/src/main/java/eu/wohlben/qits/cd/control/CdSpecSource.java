@@ -27,17 +27,22 @@ public interface CdSpecSource {
   DeploymentSpec read(String repoId, String sha);
 
   /**
-   * What a repository declares about how it is deployed. Three keys, all optional, and the shape a
+   * What a repository declares about how it is deployed. Four keys, all optional, and the shape a
    * repository with no file at all gets is {@link #DEFAULTS}.
+   *
+   * <p>{@code healthPath} is the exception rather than the rule: a service that says nothing gets
+   * the convention path derived from its name, and only a service whose path does not follow the
+   * convention (the gateway owns the root path space) has to name one.
    */
-  record DeploymentSpec(CdDeploymentTarget target, boolean availableOnEnv, String branch) {
+  record DeploymentSpec(
+      CdDeploymentTarget target, boolean availableOnEnv, String branch, String healthPath) {
 
     /** The branch a singleton deploys from when it names none. */
     public static final String DEFAULT_SINGLETON_BRANCH = "main";
 
     /** No file, or a file that sets nothing: an ordinary environment application. */
     public static final DeploymentSpec DEFAULTS =
-        new DeploymentSpec(CdDeploymentTarget.ENVIRONMENT, false, null);
+        new DeploymentSpec(CdDeploymentTarget.ENVIRONMENT, false, null, null);
 
     /** The branch this singleton deploys from — its own, or the convention. */
     public String singletonBranch() {

@@ -6,7 +6,7 @@ import java.util.HashSet;
 import java.util.Set;
 
 /**
- * The strict reader of {@code .config/qits/deployments.yml}. Three scalar keys, no nesting, no
+ * The strict reader of {@code .config/qits/deployments.yml}. Four scalar keys, no nesting, no
  * lists — so this is a line reader rather than a YAML library, and being one is what makes every
  * rejection a sentence naming the file and the line.
  *
@@ -14,6 +14,7 @@ import java.util.Set;
  * deployment_target: environment   # default when the key or the file is absent | singleton
  * available_on_env: false          # default; true = public node (bundle + hub joins)
  * branch: main                     # singleton only: the branch that deploys it (default main)
+ * health_path: /q/health/ready     # default: /&lt;name without the qits- prefix&gt;/q/health/ready
  * </pre>
  *
  * <p><b>Strict on purpose.</b> A typo in this file decides where a container runs and what can
@@ -28,6 +29,7 @@ public final class DeploymentSpecParser {
   private static final String TARGET = "deployment_target";
   private static final String AVAILABLE_ON_ENV = "available_on_env";
   private static final String BRANCH = "branch";
+  private static final String HEALTH_PATH = "health_path";
 
   private DeploymentSpecParser() {}
 
@@ -39,6 +41,7 @@ public final class DeploymentSpecParser {
     CdDeploymentTarget target = CdDeploymentTarget.ENVIRONMENT;
     boolean availableOnEnv = false;
     String branch = null;
+    String healthPath = null;
     Set<String> seen = new HashSet<>();
 
     String[] lines = (yaml == null ? "" : yaml).split("\\R", -1);
@@ -65,6 +68,7 @@ public final class DeploymentSpecParser {
         case TARGET -> target = target(value, source, lineNumber);
         case AVAILABLE_ON_ENV -> availableOnEnv = bool(key, value, source, lineNumber);
         case BRANCH -> branch = branch(value, source, lineNumber);
+        case HEALTH_PATH -> healthPath = healthPath(value, source, lineNumber);
         default ->
             throw error(
                 source,
@@ -75,8 +79,10 @@ public final class DeploymentSpecParser {
                     + TARGET
                     + ", "
                     + AVAILABLE_ON_ENV
+                    + ", "
+                    + BRANCH
                     + " and "
-                    + BRANCH);
+                    + HEALTH_PATH);
       }
     }
 
@@ -88,7 +94,7 @@ public final class DeploymentSpecParser {
               + ": true` is not something a singleton can be — it already runs on every"
               + " environment's networks, and the bundle is environment-scoped");
     }
-    return new DeploymentSpec(target, availableOnEnv, branch);
+    return new DeploymentSpec(target, availableOnEnv, branch, healthPath);
   }
 
   private static CdDeploymentTarget target(String value, String source, int line) {
@@ -117,6 +123,19 @@ public final class DeploymentSpecParser {
       return CdIdentifiers.requireBranch(value);
     } catch (RuntimeException e) {
       throw error(source, line, "`" + BRANCH + "` is not a plain ref name: " + value);
+    }
+  }
+
+  /**
+   * The health gate's URL path inside the container, checked here with the same rule the API uses —
+   * an absolute path and nothing a shell or an argv would read as punctuation, because this value
+   * ends up in a {@code --health-cmd}.
+   */
+  private static String healthPath(String value, String source, int line) {
+    try {
+      return CdIdentifiers.requireHealthPath(value);
+    } catch (RuntimeException e) {
+      throw error(source, line, "`" + HEALTH_PATH + "` is not an absolute URL path: " + value);
     }
   }
 

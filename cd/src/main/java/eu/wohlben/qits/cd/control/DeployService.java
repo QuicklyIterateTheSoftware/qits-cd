@@ -75,6 +75,9 @@ public class DeployService {
 
   private static final Logger LOG = Logger.getLogger(DeployService.class);
 
+  /** Every platform repository carries it, and no path segment does. */
+  private static final String NAME_PREFIX = "qits-";
+
   @Inject CdDeploymentRepository deployments;
   @Inject DeploymentDriver driver;
   @Inject CdSpecSource specs;
@@ -86,6 +89,10 @@ public class DeployService {
   @ConfigProperty(name = "qits.artifacts.image-repository")
   String imageRepository;
 
+  /**
+   * The last resort at deploy time, for a service row that carries no path. Registration writes
+   * {@link #conventionHealthPath} now, so this only reaches rows an older cd wrote.
+   */
   @ConfigProperty(name = "qits.cd.default-health-path")
   String defaultHealthPath;
 
@@ -367,7 +374,7 @@ public class DeployService {
     for (RegEnvironment environment : matching) {
       links.add(environment.id());
     }
-    String healthPath = known.map(RegService::healthPath).orElse(null);
+    String healthPath = resolveHealthPath(repoId, spec, known);
     registry.upsertService(
         new ServiceUpsert(
             repoId,
@@ -417,7 +424,7 @@ public class DeployService {
     if (known.isEmpty()) {
       LOG.infof("Registered %s as a platform singleton", repoId);
     }
-    String healthPath = known.map(RegService::healthPath).orElse(null);
+    String healthPath = resolveHealthPath(repoId, spec, known);
     registry.upsertService(
         new ServiceUpsert(
             repoId,
@@ -447,6 +454,47 @@ public class DeployService {
     return List.of(
         new Target(
             repoId, null, null, null, CdDeploymentTarget.SINGLETON, false, healthPath));
+  }
+
+  /**
+   * Where a service's health path comes from, in this order: the repository's own {@code
+   * health_path}, then the value the registry already holds, then the convention derived from the
+   * name. The convention is <b>written to the registry</b> like every other derived fact, so a
+   * fresh registry gets working health gates with nothing to fill in by hand.
+   *
+   * <p>The registry's value sits between the two on purpose. An operator who PUT a path is fixing
+   * something cd got wrong, and a later green build must not undo the fix; a repository that states
+   * its own path is the more specific statement and does.
+   *
+   * <p>What this replaces: registration had no source for the path at all, so every row was written
+   * null, every deployment fell back to {@code qits.cd.default-health-path} ({@code
+   * /q/health/ready}), and every service mounted under its own prefix — all of them but the
+   * gateway — failed a health gate against a URL that 404s while the container was fine.
+   */
+  private static String resolveHealthPath(
+      String applicationName, DeploymentSpec spec, Optional<RegService> known) {
+    if (spec.healthPath() != null) {
+      return spec.healthPath();
+    }
+    return known
+        .map(RegService::healthPath)
+        .filter(path -> path != null && !path.isBlank())
+        .orElseGet(() -> conventionHealthPath(applicationName));
+  }
+
+  /**
+   * The platform's path convention: a service serves everything under its own name without the
+   * {@code qits-} prefix, so qits-observability answers on {@code /observability/q/health/ready}.
+   * A name that does not carry the prefix keeps the whole name.
+   */
+  static String conventionHealthPath(String applicationName) {
+    String segment =
+        applicationName.startsWith(NAME_PREFIX)
+            ? applicationName.substring(NAME_PREFIX.length())
+            : applicationName;
+    // A repository called exactly `qits-` would leave nothing to mount under; keep its whole name
+    // rather than compose a path with an empty segment in it.
+    return "/" + (segment.isBlank() ? applicationName : segment) + "/q/health/ready";
   }
 
   /**
